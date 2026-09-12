@@ -215,14 +215,18 @@ export function sendAvailableCommands(
 
 /**
  * Does this client see the `$` skill-name grouping? The prefix is a DISPLAY
- * convention for editors (Zed groups skills visually under `$`); martty and
- * unnamed clients (the remote App sends no clientInfo) surface commands by
- * typing `/` — a `$`-prefixed name never matches there, hiding every skill.
+ * convention for editors (Zed groups skills visually under `$`); martty,
+ * Paseo, and unnamed clients (the remote App sends no clientInfo) surface
+ * commands by typing `/` — a `$`-prefixed name never matches there, hiding
+ * every skill (Paseo's `/` completion filters the literal typed text against
+ * the advertised name, so `$to-tickets` is unreachable as `/to-tickets`).
  * Both spellings route identically (slash.ts accepts bare and `$`-prefixed
  * skill names), so per-client display is safe.
  */
 export function skillPrefixForClient(name: string | null): string {
-  if (name === null || name.toLowerCase().includes("martty")) return "";
+  if (name === null) return "";
+  const lower = name.toLowerCase();
+  if (lower.includes("martty") || lower.includes("paseo")) return "";
   return "$";
 }
 

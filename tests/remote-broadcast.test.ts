@@ -347,6 +347,8 @@ describe("skillPrefixForClient", () => {
     expect(skillPrefixForClient("JetBrains")).toBe("$");
     expect(skillPrefixForClient("martty")).toBe("");
     expect(skillPrefixForClient("Martty TUI")).toBe("");
+    expect(skillPrefixForClient("Paseo")).toBe("");
+    expect(skillPrefixForClient("paseo-desktop")).toBe("");
     expect(skillPrefixForClient(null)).toBe("");
   });
 });
