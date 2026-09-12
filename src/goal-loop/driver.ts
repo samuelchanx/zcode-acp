@@ -87,6 +87,8 @@ export class GoalLoopDriver {
   private stopFlag = false;
   private parked: ParkedPrompt[] = [];
   private parkSeq = 0;
+  /** Resolvers for prompt requests held open across the whole loop. */
+  private holds: Array<(msg: string) => void> = [];
   private keepalive: ReturnType<typeof setInterval> | null = null;
   private runId = 0;
   /** Set when the last goal turn was cancelled by the sandbox allow-restart. */
@@ -153,11 +155,35 @@ export class GoalLoopDriver {
         warn(`goal-loop: driver crashed (${e instanceof Error ? e.message : String(e)})`),
       )
       .finally(() => {
+        // A crashed run() may bypass endLoop — never leave a held prompt
+        // request dangling.
+        driver.settleHolds(messages().goalPaused("loop crashed"));
         // Identity check: a NEWER driver for this sid (pause → fresh start in
         // the endLoop announce window) must not be unregistered by this one.
         if (server.goalLoops.get(zcodeSid) === driver) server.goalLoops.delete(zcodeSid);
       });
     return driver;
+  }
+
+  /**
+   * Hold an ACP prompt request open until the loop settles (completed,
+   * paused, or stopped), resolving with a final status line. Unlike
+   * parkPrompt, no text merges into rounds. Clients like Paseo only render
+   * live session/update events while a prompt turn is active — a
+   * fire-and-forget start made every round invisible to them.
+   */
+  holdRequest(): Promise<string> {
+    return new Promise<string>((resolve) => {
+      this.holds.push(resolve);
+      this.armKeepalive();
+    });
+  }
+
+  private settleHolds(msg: string): void {
+    const resolvers = this.holds;
+    this.holds = [];
+    for (const resolve of resolvers) resolve(msg);
+    if (this.parked.length === 0) this.disarmKeepalive();
   }
 
   /** Pause at the next round boundary (the in-flight round keeps running). */
@@ -215,7 +241,7 @@ export class GoalLoopDriver {
   private armKeepalive(): void {
     if (this.keepalive) return;
     this.keepalive = setInterval(() => {
-      if (this.parked.length === 0) {
+      if (this.parked.length === 0 && this.holds.length === 0) {
         this.disarmKeepalive();
         return;
       }
@@ -243,7 +269,7 @@ export class GoalLoopDriver {
   private settleParked(r: acp.PromptResponse, keepText: boolean, snapshot?: ParkedPrompt[]): void {
     const resolving = snapshot ?? [...this.parked];
     if (resolving.length === 0) {
-      if (this.parked.length === 0) this.disarmKeepalive();
+      if (this.parked.length === 0 && this.holds.length === 0) this.disarmKeepalive();
       return;
     }
     const ids = new Set(resolving.map((p) => p.id));
@@ -396,6 +422,7 @@ export class GoalLoopDriver {
     // Settle parked prompts BEFORE persisting: keepText stores their text in
     // the state that the persist below must include.
     this.settleParked({ stopReason: "cancelled" }, status.startsWith("paused"));
+    this.settleHolds(note ?? messages().goalPaused(reason));
     this.persist();
     if (status === "stopped") clearGoalState(this.server.projectCwd(), this.zcodeSid);
     await this.announce(note ?? messages().goalPaused(reason));
