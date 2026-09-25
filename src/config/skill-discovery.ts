@@ -11,7 +11,7 @@
  * Discovery sources (in priority order — first occurrence wins on name clash):
  *   1. <zcode-home>/skills/&#42;/SKILL.md      (user scope, ZCode native)
  *   2. ~/.agents/skills/&#42;/SKILL.md          (user scope, shared agents)
- *   3. enabled plugin <cache>/skills/&#42;/SKILL.md
+ *   3. enabled plugin <cache>/skills/[&#42;/]&#42;/SKILL.md   (flat or category layout)
  *   4. <cwd>/.agents/skills/&#42;/SKILL.md      (project scope)
  *
  * `<zcode-home>` is the ZCode data root (`~/.zcode`, or `$ZCODE_HOME` when
@@ -86,6 +86,43 @@ function loadDisabledSkillPaths(config: CliConfig | null): Set<string> {
     if (cfg?.enable === false) disabled.add(skillPath);
   }
   return disabled;
+}
+
+/**
+ * Scan a plugin's `skills/` directory. Plugins ship two layouts:
+ *   flat      — `<plugin>/<ver>/skills/<name>/SKILL.md`
+ *   category  — `<plugin>/<ver>/skills/<category>/<name>/SKILL.md`
+ *              (e.g. mattpocock-skills `skills/engineering/implement/`)
+ * A directory that carries its own SKILL.md is itself a skill and is never
+ * descended into — helper dirs inside a skill (e.g. `implement/agents/`)
+ * must not be advertised.
+ */
+function scanPluginSkillsDir(
+  skillsDir: string,
+  disabledPaths: Set<string>,
+  results: SkillEntry[],
+  seen: Set<string>,
+): void {
+  // Flat layout first (priority on name clash within the plugin).
+  scanSkillDir(skillsDir, disabledPaths, results, seen);
+  if (!existsSync(skillsDir)) return;
+  let entries: string[];
+  try {
+    entries = readdirSync(skillsDir);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const catDir = path.join(skillsDir, entry);
+    try {
+      if (!statSync(catDir).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    // Category dirs group skills; a real skill dir is handled above.
+    if (existsSync(path.join(catDir, "SKILL.md"))) continue;
+    scanSkillDir(catDir, disabledPaths, results, seen);
+  }
 }
 
 /** Scan a directory for skill subdirectories containing SKILL.md. */
@@ -199,7 +236,7 @@ export function loadSkillCommands(): SkillEntry[] {
     }
     if (!latestVersion) continue;
 
-    scanSkillDir(path.join(pluginDir, latestVersion, "skills"), disabledPaths, results, seen);
+    scanPluginSkillsDir(path.join(pluginDir, latestVersion, "skills"), disabledPaths, results, seen);
   }
 
   // 4. Project-level .agents/skills/ (if exists).
