@@ -127,6 +127,17 @@ function isKnownCommand(cmd: string): boolean {
 }
 
 /**
+ * Drop the cached known-command set so the next `neutralizeSlashText()` /
+ * `handleSlashCommand()` rescan the filesystem. Called whenever the advertised
+ * command list is rebuilt (per session open) so a skill installed after the
+ * bridge process started is recognised as a real command instead of being
+ * zero-width-space neutralised as unknown text.
+ */
+export function resetKnownCommandCache(): void {
+  knownCommands = null;
+}
+
+/**
  * Neutralise slash-command resolution for prompts that are NOT real commands.
  *
  * The backend parses any prompt whose trimmed text starts with `/` as a

@@ -38,6 +38,7 @@ import {
   updateRuntimeModelConfig,
 } from "./handlers/extensions.js";
 import { echoUserPromptToOthers, sendAvailableCommandsDeferred } from "./handlers/io.js";
+import { resetKnownCommandCache } from "./handlers/slash.js";
 import { loadEarlier } from "./handlers/replay.js";
 import { resendPendingInteractions } from "./handlers/server-requests.js";
 import { loadPluginCommands } from "./config/plugin-commands.js";
@@ -52,9 +53,11 @@ import { AGENT_INFO, SLASH_COMMANDS, log, warn } from "./utils.js";
 
 /**
  * Build the full slash-command list: static bridge commands + dynamic plugin
- * commands + discovered skills. Called once at startup (nothing changes
- * mid-session). Deduplicates by name — static commands take priority, then
- * plugins, then skills.
+ * commands + discovered skills. Rebuilt on every session open (new/resume/
+ * load) — bridges are long-lived per-agent processes, and a startup snapshot
+ * would keep advertising a stale menu (and ZWSP-neutralise freshly installed
+ * skill commands) until the process happened to respawn. Deduplicates by
+ * name — static commands take priority, then plugins, then skills.
  */
 function buildAllCommands() {
   const pluginCommands = loadPluginCommands();
@@ -78,6 +81,16 @@ function buildAllCommands() {
   return merged;
 }
 
+/**
+ * Fresh command surface for a session open: rescan the filesystem and drop
+ * the slash handler's known-command cache so passthrough decisions
+ * (`neutralizeSlashText`) and the advertised menu can never disagree.
+ */
+function freshCommands(): ReturnType<typeof buildAllCommands> {
+  resetKnownCommandCache();
+  return buildAllCommands();
+}
+
 export async function main(): Promise<void> {
   // Remote config is parsed BEFORE the server exists: a hub-incubated REPL
   // bridge (ADR-0016) arrives with ZCODE_ACP_REMOTE_PIN_CWD=1, and the pin
@@ -89,9 +102,6 @@ export async function main(): Promise<void> {
 
   const stream = acp.ndJsonStream(outbound, inbound);
   const server = new ZcodeAcpServer({ serveMode: remoteConfigEarly?.pinCwd === true });
-
-  // Load all commands once at startup (they don't change mid-session).
-  const allCommands = buildAllCommands();
 
   log(`starting ${AGENT_INFO.name} ${AGENT_INFO.version}, ACP protocol v${acp.PROTOCOL_VERSION}`);
 
@@ -130,7 +140,7 @@ export async function main(): Promise<void> {
   }, 2000);
   backendDeathInterval.unref();
 
-  const app = buildAgentApp(server, allCommands);
+  const app = buildAgentApp(server, freshCommands);
 
   // Register broadcast tracking BEFORE connect so the stdio connection is
   // captured, then wire the stdio transport. The same app is later shared
@@ -151,7 +161,7 @@ export async function main(): Promise<void> {
  * the stdio server (`main`) and the headless serve bridge (`runHeadless`) —
  * one build, two transports.
  */
-function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof buildAllCommands>) {
+function buildAgentApp(server: ZcodeAcpServer, buildCommands: () => ReturnType<typeof buildAllCommands>) {
   /** Passthrough params parser for the ZCode-specific extension methods. */
   const extParams = z.object({ sessionId: z.string() }).passthrough();
 
@@ -162,7 +172,7 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
       .onRequest("session/new", async (ctx) => {
         const result = await newSession(server, ctx.params, ctx.client);
         for (const sid of server.sessionAliases(result.sessionId)) {
-          sendAvailableCommandsDeferred(server.clients, sid, allCommands);
+          sendAvailableCommandsDeferred(server.clients, sid, buildCommands());
         }
         return result;
       })
@@ -170,7 +180,7 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
       .onRequest("session/resume", async (ctx) => {
         const result = await resumeSession(server, ctx.params, server.clients.broadcast());
         for (const sid of server.sessionAliases(ctx.params.sessionId)) {
-          sendAvailableCommandsDeferred(server.clients, sid, allCommands);
+          sendAvailableCommandsDeferred(server.clients, sid, buildCommands());
         }
         // A client that (re)connects catches up via resume/load; any interaction
         // request still waiting for an answer is re-sent to it so a question
@@ -181,7 +191,7 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
       .onRequest("session/load", async (ctx) => {
         const result = await loadSession(server, ctx.params, server.clients.broadcast());
         for (const sid of server.sessionAliases(ctx.params.sessionId)) {
-          sendAvailableCommandsDeferred(server.clients, sid, allCommands);
+          sendAvailableCommandsDeferred(server.clients, sid, buildCommands());
         }
         resendPendingInteractions(server, ctx.client, ctx.params.sessionId);
         return result;
@@ -297,7 +307,6 @@ export async function runHeadless(): Promise<void> {
     process.exit(2);
   }
   const server = new ZcodeAcpServer({ serveMode: true });
-  const allCommands = buildAllCommands();
   log(
     `starting ${AGENT_INFO.name} ${AGENT_INFO.version} serve (headless), project=${server.projectCwd()}`,
   );
@@ -327,7 +336,7 @@ export async function runHeadless(): Promise<void> {
   // stdin ignored, and ADR-0001's "editor closed stdin" signal has no editor
   // to come from — idle exit below is this mode's shutdown path.
 
-  const app = buildAgentApp(server, allCommands);
+  const app = buildAgentApp(server, freshCommands);
   // Track connections BEFORE the endpoint accepts any WS client so every
   // remote connection lands in the broadcast registry from its first message.
   trackConnections(app, server.clients);
