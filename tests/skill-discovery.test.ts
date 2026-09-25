@@ -205,6 +205,61 @@ describe("loadSkillCommands", () => {
     expect(skills[0]!.name).toBe("$docx");
   });
 
+  it("discovers category-layout plugin skills (skills/<category>/<name>/SKILL.md)", () => {
+    resetMocks();
+    const cacheDir = `${HOME}/.zcode/cli/plugins/cache`;
+    const skillsDir = `${cacheDir}/claude-plugins-official/matt-skills/1.2.3/skills`;
+    mockFiles.set(
+      `${HOME}/.zcode/cli/config.json`,
+      JSON.stringify({
+        plugins: { enabledPlugins: { "matt-skills@claude-plugins-official": true } },
+      }),
+    );
+    mockDirs.add(cacheDir);
+    mockDirs.add(`${cacheDir}/claude-plugins-official`);
+    mockDirs.add(`${cacheDir}/claude-plugins-official/matt-skills`);
+    mockDirs.add(`${cacheDir}/claude-plugins-official/matt-skills/1.2.3`);
+    mockDirs.add(skillsDir);
+    mockDirs.add(`${skillsDir}/engineering`);
+    mockDirs.add(`${skillsDir}/productivity`);
+    setSkill(`${skillsDir}/engineering`, "implement", "Implement a spec.");
+    setSkill(`${skillsDir}/productivity`, "teach", "Teach a concept.");
+    // Flat-layout skill in the SAME plugin must still be found.
+    setSkill(skillsDir, "setup-matt-skills", "Configure the plugin.");
+
+    const skills = loadSkillCommands();
+    expect(skills.map((s) => s.name).sort()).toEqual([
+      "$implement",
+      "$setup-matt-skills",
+      "$teach",
+    ]);
+  });
+
+  it("does not descend into a plugin skill's own helper directories", () => {
+    resetMocks();
+    const cacheDir = `${HOME}/.zcode/cli/plugins/cache`;
+    const skillsDir = `${cacheDir}/claude-plugins-official/matt-skills/1.2.3/skills`;
+    mockFiles.set(
+      `${HOME}/.zcode/cli/config.json`,
+      JSON.stringify({
+        plugins: { enabledPlugins: { "matt-skills@claude-plugins-official": true } },
+      }),
+    );
+    mockDirs.add(cacheDir);
+    mockDirs.add(`${cacheDir}/claude-plugins-official`);
+    mockDirs.add(`${cacheDir}/claude-plugins-official/matt-skills`);
+    mockDirs.add(`${cacheDir}/claude-plugins-official/matt-skills/1.2.3`);
+    mockDirs.add(skillsDir);
+    mockDirs.add(`${skillsDir}/engineering`);
+    setSkill(`${skillsDir}/engineering`, "implement", "Implement a spec.");
+    // Helper dir INSIDE a real skill (implement/agents/) — must not surface
+    // as a skill even if it carries a SKILL.md.
+    setSkill(`${skillsDir}/engineering/implement`, "agents", "Sub-agent prompt.");
+
+    const skills = loadSkillCommands();
+    expect(skills.map((s) => s.name)).toEqual(["$implement"]);
+  });
+
   it("skips skills from disabled plugins", () => {
     resetMocks();
     const cacheDir = `${HOME}/.zcode/cli/plugins/cache`;
