@@ -139,7 +139,20 @@ function knownCommandSet(): Set<string> {
 }
 
 /**
+ * Drop the cached known-command set so the next `neutralizeSlashText()` /
+ * `handleSlashCommand()` rescan the filesystem. Called whenever the advertised
+ * command list is rebuilt (per session open) so a skill installed after the
+ * bridge process started is recognised as a real command instead of being
+ * zero-width-space neutralised as unknown text.
+ */
+export function resetKnownCommandCache(): void {
+  knownCommands = null;
+}
+
+/**
  * Wire text for `/`-leading prompts. Identity on 0.16.9 — see below.
+ *
+ * This used to prefix unknown `/x` prompts with a zero-width space, on the
  *
  * This used to prefix unknown `/x` prompts with a zero-width space, on the
  * reverse-engineered belief that the backend hard-fails a turn whose prompt

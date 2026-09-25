@@ -38,6 +38,7 @@ import {
   setThoughtLevel,
 } from "./handlers/extensions.js";
 import { echoUserPromptToOthers, sendAvailableCommandsDeferred } from "./handlers/io.js";
+import { resetKnownCommandCache } from "./handlers/slash.js";
 import { loadEarlier } from "./handlers/replay.js";
 import { resendPendingInteractions } from "./handlers/server-requests.js";
 import { loadPluginCommands } from "./config/plugin-commands.js";
@@ -53,9 +54,11 @@ import { AGENT_INFO, SLASH_COMMANDS, log, warn } from "./utils.js";
 
 /**
  * Build the full slash-command list: static bridge commands + dynamic plugin
- * commands + discovered skills. Called once at startup (nothing changes
- * mid-session). Deduplicates by name — static commands take priority, then
- * plugins, then skills.
+ * commands + discovered skills. Rebuilt on every session open (new/resume/
+ * load) — bridges are long-lived per-agent processes, and a startup snapshot
+ * would keep advertising a stale menu (and ZWSP-neutralise freshly installed
+ * skill commands) until the process happened to respawn. Deduplicates by
+ * name — static commands take priority, then plugins, then skills.
  */
 function buildAllCommands() {
   const pluginCommands = loadPluginCommands();
@@ -79,6 +82,16 @@ function buildAllCommands() {
   return merged;
 }
 
+/**
+ * Fresh command surface for a session open: rescan the filesystem and drop
+ * the slash handler's known-command cache so passthrough decisions
+ * (`neutralizeSlashText`) and the advertised menu can never disagree.
+ */
+function freshCommands(): ReturnType<typeof buildAllCommands> {
+  resetKnownCommandCache();
+  return buildAllCommands();
+}
+
 export async function main(): Promise<void> {
   // Crash guards FIRST: any later async task that rejects without a catch
   // must warn, not kill the process (the whole TUI window dies with us).
@@ -93,9 +106,6 @@ export async function main(): Promise<void> {
 
   const stream = acp.ndJsonStream(outbound, inbound);
   const server = new ZcodeAcpServer({ serveMode: remoteConfigEarly?.pinCwd === true });
-
-  // Load all commands once at startup (they don't change mid-session).
-  const allCommands = buildAllCommands();
 
   log(`starting ${AGENT_INFO.name} ${AGENT_INFO.version}, ACP protocol v${acp.PROTOCOL_VERSION}`);
 
@@ -134,7 +144,7 @@ export async function main(): Promise<void> {
   }, 2000);
   backendDeathInterval.unref();
 
-  const app = buildAgentApp(server, allCommands);
+  const app = buildAgentApp(server, freshCommands);
 
   // Register broadcast tracking BEFORE connect so the stdio connection is
   // captured, then wire the stdio transport. The same app is later shared
@@ -155,10 +165,11 @@ export async function main(): Promise<void> {
  * the stdio server (`main`) and the headless serve bridge (`runHeadless`) —
  * one build, two transports.
  */
-function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof buildAllCommands>) {
+function buildAgentApp(server: ZcodeAcpServer, buildCommands: () => ReturnType<typeof buildAllCommands>) {
   // Exposed for the gate-aware menu catch-up (resendMenuAfterGateSettled in
   // handlers/session.ts) — a cold bridge's menu snapshot predates the verdict.
-  server.allCommands = allCommands;
+  // Built fresh so the catch-up list reflects plugins installed since boot.
+  server.allCommands = buildCommands();
   /** Passthrough params parser for the ZCode-specific extension methods. */
   const extParams = z.object({ sessionId: z.string() }).passthrough();
 
@@ -172,7 +183,7 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
           sendAvailableCommandsDeferred(
             server.clients,
             sid,
-            filterWorkflowCommands(server, allCommands),
+            filterWorkflowCommands(server, buildCommands()),
           );
         }
         return result;
@@ -190,7 +201,7 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
           sendAvailableCommandsDeferred(
             server.clients,
             sid,
-            filterWorkflowCommands(server, allCommands),
+            filterWorkflowCommands(server, buildCommands()),
           );
         }
         // A client that (re)connects catches up via resume/load; any interaction
@@ -206,7 +217,7 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
           sendAvailableCommandsDeferred(
             server.clients,
             sid,
-            filterWorkflowCommands(server, allCommands),
+            filterWorkflowCommands(server, buildCommands()),
           );
         }
         resendPendingInteractions(server, ctx.client, ctx.params.sessionId);
@@ -328,7 +339,6 @@ export async function runHeadless(): Promise<void> {
     process.exit(2);
   }
   const server = new ZcodeAcpServer({ serveMode: true });
-  const allCommands = buildAllCommands();
   log(
     `starting ${AGENT_INFO.name} ${AGENT_INFO.version} serve (headless), project=${server.projectCwd()}`,
   );
@@ -358,7 +368,7 @@ export async function runHeadless(): Promise<void> {
   // stdin ignored, and ADR-0001's "editor closed stdin" signal has no editor
   // to come from — idle exit below is this mode's shutdown path.
 
-  const app = buildAgentApp(server, allCommands);
+  const app = buildAgentApp(server, freshCommands);
   // Track connections BEFORE the endpoint accepts any WS client so every
   // remote connection lands in the broadcast registry from its first message.
   trackConnections(app, server.clients);
