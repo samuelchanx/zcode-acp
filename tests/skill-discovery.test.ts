@@ -175,6 +175,25 @@ describe("loadSkillCommands", () => {
     expect(skills[0]!.description).toBe("From .zcode (first).");
   });
 
+  it("discovers skills from <cwd>/.zcode/skills/ (project scope)", () => {
+    resetMocks();
+    const cwd = process.cwd();
+    setSkill(`${cwd}/.zcode/skills`, "trade-chart", "Standard evidence chart spec.");
+    const skills = loadSkillCommands();
+    expect(skills).toHaveLength(1);
+    expect(skills[0]!.name).toBe("$trade-chart");
+  });
+
+  it("project .zcode/skills wins over project .agents/skills on name clash", () => {
+    resetMocks();
+    const cwd = process.cwd();
+    setSkill(`${cwd}/.zcode/skills`, "dup", "From project .zcode (first).");
+    setSkill(`${cwd}/.agents/skills`, "dup", "From project .agents (second).");
+    const skills = loadSkillCommands();
+    expect(skills).toHaveLength(1);
+    expect(skills[0]!.description).toBe("From project .zcode (first).");
+  });
+
   it("discovers skills from enabled plugins", () => {
     resetMocks();
     const cacheDir = `${HOME}/.zcode/cli/plugins/cache`;

@@ -12,7 +12,12 @@
  *   1. <zcode-home>/skills/&#42;/SKILL.md      (user scope, ZCode native)
  *   2. ~/.agents/skills/&#42;/SKILL.md          (user scope, shared agents)
  *   3. enabled plugin <cache>/skills/[&#42;/]&#42;/SKILL.md   (flat or category layout)
- *   4. <cwd>/.agents/skills/&#42;/SKILL.md      (project scope)
+ *   4. <cwd>/.zcode/skills/&#42;/SKILL.md       (project scope, ZCode native)
+ *   5. <cwd>/.agents/skills/&#42;/SKILL.md      (project scope)
+ *
+ * ZCode itself scans workspace `.zcode/skills` before `.agents/skills` at the
+ * same scope (see the zcode-configuration-guide plugin); the bridge mirrors
+ * that order.
  *
  * `<zcode-home>` is the ZCode data root (`~/.zcode`, or `$ZCODE_HOME` when
  * set — see `zcodeHomeDir()`). Skills explicitly disabled in
@@ -239,7 +244,11 @@ export function loadSkillCommands(): SkillEntry[] {
     scanPluginSkillsDir(path.join(pluginDir, latestVersion, "skills"), disabledPaths, results, seen);
   }
 
-  // 4. Project-level .agents/skills/ (if exists).
+  // 4. Project-level .zcode/skills/ (if exists) — ZCode-native project scope,
+  //    scanned before .agents to mirror ZCode's own precedence.
+  scanSkillDir(path.join(process.cwd(), ".zcode", "skills"), disabledPaths, results, seen);
+
+  // 5. Project-level .agents/skills/ (if exists).
   scanSkillDir(path.join(process.cwd(), ".agents", "skills"), disabledPaths, results, seen);
 
   log(`skill-discovery: loaded ${results.length} skill(s)`);
