@@ -60,10 +60,14 @@ export async function currentModelCached(
 }
 
 /**
- * Last completed turn's context size from the zcode store
- * (`~/.zcode/cli/db/db.sqlite`, override with `ZCODE_USAGE_DB`). The final
- * completed turn re-sent the entire context to the model, so its
- * `computed_total_tokens` (input + output) IS the current context usage.
+ * Last completed model request's context size from the zcode store
+ * (`~/.zcode/cli/db/db.sqlite`, override with `ZCODE_USAGE_DB`). One TURN makes
+ * many model requests (one per tool-call round-trip), each re-sending the whole
+ * context — so the turn-level `turn_usage.computed_total_tokens` SUMS them and
+ * runs far past the window on agentic turns (observed 22.7M on a 1M model).
+ * `model_usage` is per request; its newest completed row's
+ * `computed_total_tokens` (input + output of that single request) IS the
+ * context size as of the end of the last turn.
  * Read-only + WAL: safe alongside a live backend. Returns 0 when the store is
  * missing, the runtime lacks `node:sqlite`, or the session has no turns yet.
  */
@@ -77,14 +81,24 @@ async function lastTurnContextUsed(zcodeSid: string): Promise<number> {
     const { DatabaseSync } = await import("node:sqlite");
     const db = new DatabaseSync(dbPath, { readOnly: true });
     try {
+      // Per-request truth first; the turn-level aggregate is a coarse
+      // fallback for stores without model_usage rows.
       const row = db
         .prepare(
-          `SELECT computed_total_tokens AS total FROM turn_usage
-           WHERE session_id = ? AND status = 'completed'
-           ORDER BY started_at DESC LIMIT 1`,
+          `SELECT (
+               SELECT computed_total_tokens FROM model_usage
+               WHERE session_id = ?1 AND status = 'completed'
+               ORDER BY started_at DESC LIMIT 1
+             ) AS per_request,
+             (
+               SELECT computed_total_tokens FROM turn_usage
+               WHERE session_id = ?1 AND status = 'completed'
+               ORDER BY started_at DESC LIMIT 1
+             ) AS per_turn`,
         )
-        .get(zcodeSid) as { total?: number } | undefined;
-      return row?.total && row.total > 0 ? row.total : 0;
+        .get(zcodeSid) as { per_request?: number; per_turn?: number } | undefined;
+      const total = row?.per_request ?? row?.per_turn;
+      return total && total > 0 ? total : 0;
     } finally {
       db.close();
     }
@@ -100,8 +114,8 @@ async function lastTurnContextUsed(zcodeSid: string): Promise<number> {
  * Also syncs the differ's usage baseline so the first turn won't re-emit it.
  *
  * Note: the backend's `projection.contextUsed` is 0 after resume — it only
- * updates after a new turn completes. The store's last completed turn
- * (`turn_usage.computed_total_tokens`) covers that gap: it is the context size
+ * updates after a new turn completes. The store's last completed model request
+ * (`model_usage.computed_total_tokens`) covers that gap: it is the context size
  * as of the end of the last turn, so a resumed session shows an accurate bar
  * immediately instead of waiting for the first post-resume message.
  */
