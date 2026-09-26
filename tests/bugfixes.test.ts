@@ -16,9 +16,9 @@ import { ProjectionDiffer } from "../src/translators/projection-differ.js";
 import { flattenTodos } from "../src/handlers/session.js";
 import {
   buildConfigOptions,
-  formatModelValue,
   loadAllModels,
   orderThoughtVariants,
+  parseModelValue,
 } from "../src/config/options.js";
 import { CONFIG_META } from "../src/utils.js";
 import { ZcodeAcpServer } from "../src/server.js";
@@ -294,7 +294,14 @@ describe("Bug 6: thought option is discoverable and honest", () => {
     const options = await buildConfigOptions(server, null);
     const model = options.find((o) => o.id === "model");
     const leading = loadAllModels()[0];
-    expect(model?.currentValue).toBe(formatModelValue(leading.providerId, leading.modelId));
+    // The current value uses the advertised CHOICE spelling (bare modelId for
+    // an unambiguous builtin — the legacy encoding orchestrators match on) and
+    // resolves back to the leading model.
+    expect(model?.currentValue).toBe(leading.modelId);
+    expect(parseModelValue(model?.currentValue ?? "")).toEqual({
+      providerId: leading.providerId,
+      modelId: leading.modelId,
+    });
     // The advertised current value must also be selectable in the dropdown.
     expect(model?.options.map((o) => o.value)).toContain(model?.currentValue);
   });

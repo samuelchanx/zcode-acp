@@ -1,13 +1,17 @@
 /**
- * ACP model option values always encode as providerId\modelId, including
- * builtins. Bare GLM-5.3 collided when two coding plans shipped the same id
- * and crashed clients that key on uniqueness (Paseo Command Center). A
- * collision-only prefix would have advertised different id shapes depending
- * on the user's enabled-provider set.
+ * ACP model option values stay the legacy BARE modelId for unambiguous
+ * builtins and qualify (providerId\modelId) only when the bare id would be
+ * ambiguous: colliding builtin ids across coding plans (which crashed clients
+ * that key on uniqueness — Paseo Command Center) and third-party providers.
  *
- * parseModelValue still accepts a legacy bare modelId (first enabled builtin).
- * Dropdown labels stay the bare modelId for a single builtin; colliding
- * modelIds are qualified with the provider name.
+ * Why bare is load-bearing for orchestrators: Paseo provider configs and
+ * saved agent profiles store bare modelIds and validate a REQUESTED model by
+ * exact match against the advertised values before sending the switch. The
+ * always-qualified encoding (#175) made every such stored id fail validation
+ * client-side, so flash-configured Paseo agents silently ran the default
+ * GLM-5.3 (observed 2026-09-26: 109/150 agents misrouted, daemon log full of
+ * "is not a valid acp model config option"). parseModelValue accepts both
+ * spellings inbound, so bare advertised values round-trip.
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -53,7 +57,7 @@ vi.mock("node:fs", async () => {
   };
 });
 
-const { buildConfigOptions, formatModelValue, loadAllModels, parseModelValue } =
+const { buildConfigOptions, formatModelValue, parseModelValue } =
   await import("../src/config/options.js");
 
 afterEach(() => {
@@ -91,7 +95,7 @@ describe("model configOptions uniqueness", () => {
     ]);
   });
 
-  it("encodes a single builtin as providerId\\modelId too", async () => {
+  it("advertises legacy bare ids for a single unambiguous builtin plan", async () => {
     fakeConfig = {
       provider: {
         "builtin:zai-coding-plan": codingPlan(
@@ -105,16 +109,35 @@ describe("model configOptions uniqueness", () => {
     const model = options.find((option) => option.id === "model");
     const values = model?.options.map((option) => option.value) ?? [];
 
-    expect(values).toEqual([
-      "builtin:zai-coding-plan\\GLM-5.3",
-      "builtin:zai-coding-plan\\GLM-5.3-Flash",
-    ]);
+    expect(values).toEqual(["GLM-5.3", "GLM-5.3-Flash"]);
     expect(model?.options.map((option) => option.name)).toEqual(["GLM-5.3", "GLM-5.3-Flash"]);
-    expect(model?.currentValue).toBe(formatModelValue("builtin:zai-coding-plan", "GLM-5.3"));
-    expect(parseModelValue("GLM-5.3")).toEqual({
+    // currentValue uses the same spelling as the choices so client dropdowns
+    // highlight the active model.
+    expect(model?.currentValue).toBe("GLM-5.3");
+    // Round-trip: parseModelValue resolves a bare value back to the enabled
+    // builtin provider.
+    expect(parseModelValue("GLM-5.3-Flash")).toEqual({
       providerId: "builtin:zai-coding-plan",
-      modelId: "GLM-5.3",
+      modelId: "GLM-5.3-Flash",
     });
-    expect(loadAllModels()).toHaveLength(2);
+    // formatModelValue keeps the qualified spelling for inbound/internal
+    // callers (env pin, fallback switches) — parseModelValue accepts it.
+    expect(formatModelValue("builtin:zai-coding-plan", "GLM-5.3")).toBe(
+      "builtin:zai-coding-plan\\GLM-5.3",
+    );
+  });
+
+  it("qualifies colliding builtin ids so values stay unique per plan", async () => {
+    // Colliding plans keep the #175 disambiguation: both plans ship GLM-5.3,
+    // so the bare id would be ambiguous and the qualified spelling is
+    // required for uniqueness.
+    const options = await buildConfigOptions(new ZcodeAcpServer(), null);
+    const model = options.find((option) => option.id === "model");
+    const values = model?.options.map((option) => option.value) ?? [];
+
+    expect(values).toContain("builtin:zai-coding-plan\\GLM-5.3");
+    expect(values).toContain("builtin:zai-start-plan\\GLM-5.3");
+    expect(values).not.toContain("GLM-5.3");
+    expect(values).not.toContain("GLM-5.3-Flash");
   });
 });

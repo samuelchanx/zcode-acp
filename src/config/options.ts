@@ -371,16 +371,38 @@ function buildModelSelectOptions(models: ModelRef[]): Array<{ value: string; nam
   const options: Array<{ value: string; name: string }> = [];
   const seen = new Set<string>();
   for (const model of models) {
-    const value = formatModelValue(model.providerId, model.modelId);
+    const qualify = collidingIds.has(model.modelId) || !isBuiltinProvider(model.providerId);
+    const value = qualify ? formatModelValue(model.providerId, model.modelId) : model.modelId;
     if (seen.has(value)) continue;
     seen.add(value);
-    const qualify = collidingIds.has(model.modelId) || !isBuiltinProvider(model.providerId);
     options.push({
       value,
       name: qualify ? `${model.providerName} › ${model.modelId}` : model.modelId,
     });
   }
   return options;
+}
+
+/**
+ * Spell a provider+model as an ADVERTISED configOption value (choice or
+ * currentValue): the legacy bare modelId while that is unambiguous, qualified
+ * `providerId\modelId` when the bare id would be ambiguous (colliding builtin
+ * ids across coding plans) or third-party.
+ *
+ * Bare is load-bearing for orchestrators: ACP clients such as Paseo validate a
+ * REQUESTED model id by exact match against the advertised choice values
+ * before sending the switch — an always-qualified encoding makes their stored
+ * bare ids fail validation client-side and the session silently keeps the
+ * default model (observed 2026-09-26). parseModelValue accepts both spellings
+ * inbound, so advertised values round-trip either way.
+ */
+export function modelChoiceValue(
+  providerId: string,
+  modelId: string,
+  models: ModelRef[] = loadAllModels(),
+): string {
+  const ambiguous = collidingModelIds(models).has(modelId) || !isBuiltinProvider(providerId);
+  return ambiguous ? formatModelValue(providerId, modelId) : modelId;
 }
 
 /**
@@ -561,11 +583,15 @@ export async function buildConfigOptions(
   // when settings omits providerId (legacy sessions).
   const allModels = loadAllModels();
   const currentProvider = currentProviderId || allModels[0]?.providerId || DEFAULT_PROVIDER_ID;
-  const currentModel = formatModelValue(currentProvider, currentModelId);
+  // currentValue uses the SAME spelling rule as the choices so client
+  // dropdowns highlight the active model (a qualified current over bare
+  // choices — or vice versa — reads as "nothing selected").
+  const currentModel = modelChoiceValue(currentProvider, currentModelId, allModels);
 
   // Model options: config.json enabled providers are authoritative. Values
-  // are always providerId\modelId. Builtin labels stay the bare modelId
-  // unless two providers ship the same id; third-party labels always qualify.
+  // use the same spelling rule as currentValue (see modelChoiceValue): bare
+  // modelId unless the bare id is ambiguous (colliding builtin ids across
+  // coding plans) or third-party.
   let modelOptions = buildModelSelectOptions(allModels);
   if (!modelOptions.some((o) => o.value === currentModel)) {
     // The current model isn't from an enabled provider (e.g. the session was

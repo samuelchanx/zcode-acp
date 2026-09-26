@@ -839,7 +839,10 @@ describe("store-recovered sessions (bridge restart)", () => {
     expect(resumeIdx).toBeGreaterThanOrEqual(0);
     expect(setModelIdx).toBeGreaterThan(resumeIdx);
     const model = resp.configOptions.find((o) => o.id === "model");
-    expect(model?.currentValue).toBe("builtin:bigmodel-coding-plan\\GLM-5.3");
+    // The re-advertised value follows the modelChoiceValue contract: GLM-5.3
+    // is an unambiguous builtin → bare. The QUALIFIED request still switches
+    // (parseModelValue accepts both) — this proves the round-trip.
+    expect(model?.currentValue).toBe("GLM-5.3");
   });
 
   it("session/load on a store-recovered record resumes exactly once and carries fresh mcpServers", async () => {

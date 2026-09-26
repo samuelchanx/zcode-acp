@@ -11,10 +11,11 @@
 import { randomUUID } from "node:crypto";
 import type * as acp from "@agentclientprotocol/sdk";
 
+import { configProviderIdFor } from "../config/account-provider.js";
 import { currentModelCached } from "../config/model-cache.js";
 import {
   buildConfigOptions,
-  formatModelValue,
+  modelChoiceValue,
   modelContextWindow,
   parseModelValue,
 } from "../config/options.js";
@@ -147,7 +148,14 @@ async function dispatchConfigChanged(
       if (opt) opt.currentValue = value;
     };
     if (ev.model) {
-      setById("model", formatModelValue(ev.model.providerId, ev.model.modelId));
+      // Same spelling rule as the advertised choices (bare for unambiguous
+      // builtins), with the backend's account-spelling providerId normalized
+      // to the config spelling first — a mismatched currentValue reads as
+      // "nothing selected" in client dropdowns.
+      setById(
+        "model",
+        modelChoiceValue(configProviderIdFor(ev.model.providerId), ev.model.modelId),
+      );
     }
     if (ev.mode !== undefined) setById("mode", ev.mode);
     if (ev.thought !== undefined) setById("thought", ev.thought);
