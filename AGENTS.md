@@ -104,6 +104,12 @@ src/
     └── quota.ts          Quota cards entry (`zcode-acp quota`)
 ```
 
+**Root-level sibling** (not under `src/`): `paseo-plugin/` — Paseo provider
+plugin (spec #1): registers the bridge via Paseo's `runAcpProvider` shim so
+Paseo's composer gets `usage_update` → context meter and `thought_level` →
+effort selector. NO transformers by design. Own `tsconfig.json` (root tsc
+cannot include it — `rootDir` is `src`); typechecked by `pnpm typecheck`.
+
 **Key boundary**: `backend/` talks to the ZCode subprocess. `handlers/` talks to
 the ACP client (editor). `translators/` bridges the two event models. Never mix
 ZCode protocol types into ACP notifications directly — always translate.

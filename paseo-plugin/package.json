@@ -1,0 +1,6 @@
+{
+  "name": "zcode-acp-paseo-plugin",
+  "description": "Paseo provider plugin registering the zcode-acp-server bridge via runAcpProvider.",
+  "type": "module",
+  "private": true
+}

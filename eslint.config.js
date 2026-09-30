@@ -31,7 +31,7 @@ export default [
     },
   },
   {
-    files: ["src/**/*.ts", "tests/**/*.ts"],
+    files: ["src/**/*.ts", "tests/**/*.ts", "paseo-plugin/**/*.ts"],
     languageOptions: {
       parser: tsparser,
       parserOptions: {

@@ -510,6 +510,45 @@ bypass the captcha check won't be shipped or supported here — if the provider
 ever offers an official headless credential path, this bridge will adopt it
 (see #123).
 
+### Paseo: no context-window meter for ACP providers / no effort selector
+
+**Shipped fix:** the `paseo-plugin/` directory in this repo registers the
+bridge through Paseo's official provider-plugin path, which maps both
+signals correctly — see `paseo-plugin/README.md` for install steps (the
+install/reload must be run by the user, outside a Paseo-hosted session).
+The notes below explain the gaps in the config-defined path and stay as
+the diagnosis for why the plugin exists:
+
+The bridge emits spec-clean `usage_update {used, size}` on every path
+(verified live: session/new, mid-turn, model switch, resume) and advertises
+the reasoning-effort select as `{id: "thought", category: "thought_level"}`.
+What Paseo does with those differs sharply by integration path:
+
+- **Context meter (config-defined ACP provider, `extends: "acp"`): broken
+  client-side, not fixable bridge-side.** Paseo's
+  `packages/server/src/server/agent/providers/acp-agent.ts` implements
+  `handleUsageUpdate() { void update; }` — the notification is discarded, so
+  `agent.lastUsage.contextWindowMaxTokens/UsedTokens` never populate and the
+  composer's meter renders nothing. True of every public Paseo version
+  (0.6.1 → 0.9.2 → main); native claude/codex work because their own adapters
+  set those fields. Upstream issue `getpaseo/paseo#1390` (open); all
+  community fix PRs so far closed unmerged. Nothing in this repo to change.
+- **Context meter (plugin provider, `runAcpProvider`): works today.** The
+  plugin ACP shim (`packages/plugin/src/server/acp-internal/connection.ts`)
+  maps `usage_update` → `session.usage` → `usage_updated` →
+  `agent.lastUsage`. A tiny local plugin wrapping `command:
+  ["zcode-acp-server"]` gets the meter without patching Paseo.
+- **Effort selector: supported — suppressed by a static `models` list.**
+  Paseo derives per-model thinking options from configOptions with category
+  `thought_level` and writes selections back through
+  `session/set_config_option` (which this bridge handles). But a static
+  `models` array in the provider's `~/.paseo/config.json` entry REPLACES
+  runtime discovery outright (`profileModelsAreAdditive` is hardcoded false
+  for config providers), and static entries carry no thinking options. Move
+  those entries from `models` to `additionalModels`: same-id entries merge
+  over the runtime models (labels override, thinking options survive), and
+  the selector appears.
+
 ### Interactive TUI / `script` / `expect` fails with `Operation not permitted` under the sandbox
 
 **Symptom:** inside an armed Seatbelt sandbox, pseudo-terminal allocation
