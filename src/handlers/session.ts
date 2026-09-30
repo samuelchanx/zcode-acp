@@ -68,7 +68,7 @@ import {
   ProjectionDiffer,
 } from "../translators/index.js";
 import type { InternalEvent } from "../translators/index.js";
-import { clientConnectionRoot, log, warn } from "../utils.js";
+import { clientConnectionRoot, CONFIG_DISPATCH, log, warn } from "../utils.js";
 import type { PendingTurn, ZcodeAcpServer } from "../server.js";
 import { dispatchEvent } from "./dispatch.js";
 import {
@@ -139,12 +139,15 @@ async function workflowFlag(
  * idempotent and correctly ordered (a late settle supersedes the stale send).
  */
 export function resendMenuAfterGateSettled(server: ZcodeAcpServer, acpSid: string): void {
-  if (!server.allCommands || !workflowGateNow(server)?.enabled) return;
+  if (!server.buildCommands || !workflowGateNow(server)?.enabled) return;
   for (const sid of server.sessionAliases(acpSid)) {
     sendAvailableCommandsDeferred(
       server.clients,
       sid,
-      filterWorkflowCommands(server, server.allCommands),
+      // Built AT CONSUMPTION: the builder rescans the filesystem, so the
+      // catch-up menu is as fresh as the latest installs — not the boot
+      // snapshot the session/new send may predate.
+      filterWorkflowCommands(server, server.buildCommands()),
     );
   }
 }
@@ -2285,6 +2288,23 @@ export async function setConfigOptionHandler(
   params: acp.SetSessionConfigOptionRequest,
   cx: acp.AgentContext,
 ): Promise<acp.SetSessionConfigOptionResponse> {
+  // Foreign/extension options (not model/mode/thought — e.g. Paseo's
+  // `auto_accept` feature, which its plugin path applies to every agent
+  // load as a boolean set_config_option): this bridge doesn't own them and
+  // cannot honor them, but throwing fails the caller's ENTIRE open/config-
+  // apply flow — every resumed agent came back as "Internal error"
+  // (observed 2026-09-30 via the Paseo plugin's fetch_agent_timeline).
+  // Acknowledge without change instead; the bridge-owned options below
+  // keep their strict validation.
+  if (params.configId !== "model" && !CONFIG_DISPATCH[params.configId]) {
+    return {
+      configOptions: await buildConfigOptions(
+        server,
+        server.resolveSid(params.sessionId) ?? null,
+        clientConnectionRoot(cx),
+      ),
+    };
+  }
   if (typeof params.value !== "string") {
     throw new Error(`unsupported config value type: ${String(params.value)}`);
   }

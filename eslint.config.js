@@ -21,7 +21,7 @@ export default [
   js.configs.recommended,
   {
     // Node build scripts (plain .mjs, not compiled): node globals only.
-    files: ["scripts/**/*.mjs"],
+    files: ["scripts/**/*.mjs", "paseo-plugin/**/*.mjs"],
     languageOptions: {
       globals: {
         console: "readonly",
