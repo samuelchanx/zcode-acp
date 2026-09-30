@@ -21,9 +21,11 @@
  * The provider id reuses `zcode` on purpose: Paseo registers plugin
  * provider ids without namespacing and persisted agents validate their
  * provider id against registered providers, so existing conversations keep
- * their association and resume through the plugin. Disable the config
- * entry (`agents.providers.zcode`) at switchover so exactly one ZCode
- * provider exists.
+ * their association and resume through the plugin. The `agents.providers`
+ * entry with the same id must be DELETED from the daemon config before the
+ * plugin can start — the daemon rejects any plugin provider id that exists
+ * there (presence-based, `enabled: false` is not enough), at install time
+ * and at every boot.
  */
 
 import type { PluginServerContext } from "@getpaseo/plugin/server";

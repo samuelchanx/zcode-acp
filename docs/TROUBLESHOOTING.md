@@ -516,6 +516,11 @@ ever offers an official headless credential path, this bridge will adopt it
 bridge through Paseo's official provider-plugin path, which maps both
 signals correctly — see `paseo-plugin/README.md` for install steps (the
 install/reload must be run by the user, outside a Paseo-hosted session).
+One install-time rule bites: the daemon rejects a plugin whose provider id
+already exists under `agents.providers` in the daemon config
+("cannot register configured provider ID") — the entry must be DELETED
+before the plugin starts (presence-based; `enabled: false` does not
+suffice), and must not be re-added later (the check re-runs at every boot).
 The notes below explain the gaps in the config-defined path and stay as
 the diagnosis for why the plugin exists:
 

@@ -29,7 +29,14 @@ added in the desktop app after the provider was configured.
 Plugins are trusted, unsandboxed code in the daemon, and enabling them is
 the operator's decision (`pluginsEnabled` in `~/.paseo/config.json`, applied
 with `paseo reload`). A daemon restart interrupts agents — do it from a
-plain terminal:
+plain terminal.
+
+**Order matters.** The daemon refuses to start a plugin whose provider id is
+already present under `agents.providers` ("Plugin … cannot register
+configured provider ID") — the check keys on the entry's EXISTENCE, so
+`enabled: false` is not enough, and the entry must be deleted BEFORE the
+plugin can start. Do NOT re-add the entry later either: the same check runs
+at every daemon boot and the plugin would stop starting.
 
 ```bash
 # 1. The bridge must be on the daemon's PATH.
@@ -37,20 +44,27 @@ zcode-acp-server --version   # or: npm i -g zcode-acp-server
 
 # 2. Enable plugins once (root field in ~/.paseo/config.json):
 #    { "pluginsEnabled": true, ... }
-paseo reload
 
-# 3. Install the plugin from this checkout (local-path source).
+# 3. DELETE the whole "zcode": { ... } object under "agents.providers"
+#    in ~/.paseo/config.json (keep a backup of the file first). This is
+#    what frees the provider id for the plugin.
+
+# 4. Install the plugin from this checkout (local-path source), then reload.
 paseo plugin install "$(pwd)/paseo-plugin"
-
-# 4. Disable the config-defined entry so exactly one ZCode provider exists
-#    (agents.providers.zcode.enabled = false in ~/.paseo/config.json),
-#    then reload again.
 paseo reload
 ```
 
-The provider id stays `zcode` (not namespaced): persisted conversations
-keep their provider association and resume through the plugin. New agents
-pick "ZCode" from the provider picker.
+Existing conversations are unaffected: the provider id stays `zcode`
+(not namespaced), so persisted agents validate against the
+plugin-registered provider and resume as before. New agents pick "ZCode"
+from the provider picker. If you ever want the config-defined path back,
+uninstall/disable the plugin first — both cannot own `zcode` at once.
+
+**If a previous install attempt failed** with `cannot register configured
+provider ID "zcode"`: the plugin entry is already recorded (`plugins` in
+the daemon config) and only its start failed. Delete the provider entry as
+above, then `paseo reload` followed by `paseo plugin reload zcode-acp` —
+or just restart the daemon, which retries enabled plugins at boot.
 
 ## Verifying
 
