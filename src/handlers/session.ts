@@ -84,6 +84,7 @@ import {
   fetchMessages,
   fetchMessagesSinceAnchor,
   fullSlice,
+  isPaseoLoadSession,
   readTailLimit,
   REPLY_READ_LIMIT,
   replayMessages,
@@ -1341,12 +1342,52 @@ export async function loadSession(
   // N messages aligned to turn boundaries — the full replay stays the default
   // for editors that send no `_meta` (Zed path unchanged).
   const limit = readTailLimit(params);
+  // Response-first for Paseo's plugin shim: it sets its native session id only
+  // AFTER the load promise resolves, so replay notifications sent during the
+  // handler (before the response) fail its sessionId guard and are silently
+  // dropped — every resumed agent showed an empty history (observed 2026-09-30,
+  // 755 replay updates sent, 0 delivered). JSON-RPC notifications after the
+  // response are legal; the deferred tail keeps the withReplayBatch prompt
+  // queue. Gated on `_meta.paseo` (the shim's own marker) — Zed/martty keep the
+  // synchronous order.
+  const respondFirst = isPaseoLoadSession(params);
   // Named `history` — a local `messages` would shadow the i18n `messages()`
   // helper (TDZ crash from a catch block). A resume flight's SETTLED snapshot
   // is the mid-hydration guard; only an already-live session (no flight) falls
   // back to a plain read — which fetchMessagesForReplay upgrades to a settle
   // poll when the last flight capped out mid-hydration.
   let slice: ReplaySlice;
+  // The notification tail (history replay + todos + usage) — deferred for the
+  // respondFirst shape, awaited inline otherwise (shared by the boot-resume
+  // path, which never sets respondFirst).
+  let deferredTail: (() => Promise<void>) | null = null;
+  const emitPlanAndUsage = async (): Promise<void> => {
+    // Replay the existing todo list as an initial plan so a loaded session
+    // shows its todos immediately.
+    try {
+      const snapshot = await buildSnapshot(server, zcodeSid);
+      const loadDiffer = getOrCreateDiffer(server, zcodeSid);
+      // Keep the shared differ's full diff for its mark-seen side effect on the
+      // replayed history (next turn-completion diff must not re-emit it).
+      loadDiffer.diff(snapshot);
+      // Emit the CURRENT todos on every load: the shared differ only fires on
+      // CHANGE since its lastPlanSig already matches after any prior client's
+      // diff — a re-attaching client (the mobile app always re-attaches) would
+      // otherwise never learn a plan a previous client already saw. A throwaway
+      // differ starts at the "__none__" sentinel, so diffPlan always emits.
+      const planEvents = new ProjectionDiffer().diffPlan(snapshot.todos ?? []);
+      for (const iev of planEvents) {
+        await dispatchEvent(server, cx, acpSid, iev, `load_${randomUUID().slice(0, 8)}`);
+      }
+    } catch (e) {
+      log(
+        `session/load: initial plan read failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+
+    // Initial usage_update so the editor shows the context bar immediately.
+    await emitInitialUsage(server, cx, acpSid, zcodeSid, getOrCreateDiffer(server, zcodeSid));
+  };
   if (opts.replayHistory === false) {
     // Boot-resume interception (session/new): the terminal TUI client does not
     // render replayed updates (its transcript lives in its own local store)
@@ -1369,42 +1410,49 @@ export async function loadSession(
       const history = settledHistory ?? (await fetchMessagesForReplay(server, zcodeSid));
       if (history.length > 0) server.markSessionActive(acpSid);
       const batchSlice = limit === null ? fullSlice(history) : sliceTail(history, limit);
-      await replayMessages(cx, acpSid, batchSlice.batch);
-      // total M always logged: a first-entry total below the session's real size
-      // is the signature of a mid-hydration read (see fetchMessagesSettled).
-      log(
-        `session/load: replayed ${batchSlice.meta.replayedMessages} messages` +
-          ` (total ${batchSlice.meta.totalMessages}${limit === null ? "" : `, tail limit ${limit}`})`,
-      );
+      if (respondFirst) {
+        // Dispatch deferred past the response (see respondFirst). The fetch is
+        // done; only the dispatch moves out, still under the batch so a prompt
+        // landing between response and tail queues behind the replay.
+        deferredTail = async () => {
+          try {
+            await withReplayBatch(acpSid, async () => {
+              await replayMessages(cx, acpSid, batchSlice.batch);
+              log(
+                `session/load: replayed ${batchSlice.meta.replayedMessages} messages` +
+                  ` (total ${batchSlice.meta.totalMessages}${limit === null ? "" : `, tail limit ${limit}`}, deferred post-response)`,
+              );
+            });
+            await emitPlanAndUsage();
+          } catch (e) {
+            log(
+              `session/load: deferred replay failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`,
+            );
+          }
+        };
+      } else {
+        await replayMessages(cx, acpSid, batchSlice.batch);
+        // total M always logged: a first-entry total below the session's real size
+        // is the signature of a mid-hydration read (see fetchMessagesSettled).
+        log(
+          `session/load: replayed ${batchSlice.meta.replayedMessages} messages` +
+            ` (total ${batchSlice.meta.totalMessages}${limit === null ? "" : `, tail limit ${limit}`})`,
+        );
+      }
       return batchSlice;
     });
   }
 
-  // Replay the existing todo list as an initial plan so a loaded session shows
-  // its todos immediately.
-  try {
-    const snapshot = await buildSnapshot(server, zcodeSid);
-    const loadDiffer = getOrCreateDiffer(server, zcodeSid);
-    // Keep the shared differ's full diff for its mark-seen side effect on the
-    // replayed history (next turn-completion diff must not re-emit it).
-    loadDiffer.diff(snapshot);
-    // Emit the CURRENT todos on every load: the shared differ only fires on
-    // CHANGE since its lastPlanSig already matches after any prior client's
-    // diff — a re-attaching client (the mobile app always re-attaches) would
-    // otherwise never learn a plan a previous client already saw. A throwaway
-    // differ starts at the "__none__" sentinel, so diffPlan always emits.
-    const planEvents = new ProjectionDiffer().diffPlan(snapshot.todos ?? []);
-    for (const iev of planEvents) {
-      await dispatchEvent(server, cx, acpSid, iev, `load_${randomUUID().slice(0, 8)}`);
-    }
-  } catch (e) {
-    log(
-      `session/load: initial plan read failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`,
-    );
+  if (deferredTail) {
+    // The delay must exceed the response's stdout write latency: the shim
+    // binds its session id on response receipt, and a replay frame that
+    // overtakes the response is dropped by its guard (observed with 25ms —
+    // the pipe write is queued on the same event loop as this timer, so the
+    // margin is generous by design).
+    setTimeout(() => void deferredTail!(), 250);
+  } else {
+    await emitPlanAndUsage();
   }
-
-  // Initial usage_update so the editor shows the context bar immediately.
-  await emitInitialUsage(server, cx, acpSid, zcodeSid, getOrCreateDiffer(server, zcodeSid));
 
   const modes = await buildModes(server, zcodeSid);
   server.lastMode.set(acpSid, modes.currentModeId);

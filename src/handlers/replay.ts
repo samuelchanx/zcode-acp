@@ -208,6 +208,20 @@ export function readTailLimit(params: acp.LoadSessionRequest): number | null {
 }
 
 /**
+ * Paseo's plugin shim marks its load requests with `_meta._paseo` (its
+ * provider metadata object — the shim builds `{ _paseo: {...} }` and passes
+ * it as `_meta`, so the key is double-nested on the wire). Those clients
+ * need response-first replay: the shim binds its session identity only
+ * after the load promise resolves, so replay notifications sent during the
+ * handler are dropped by its session guard (empty history on every resume
+ * — see loadSession's respondFirst).
+ */
+export function isPaseoLoadSession(params: acp.LoadSessionRequest): boolean {
+  const meta = params._meta as { paseo?: unknown; _paseo?: unknown } | undefined;
+  return Boolean(meta?.paseo ?? meta?._paseo);
+}
+
+/**
  * Drop duplicate entries the backend can return for the same message id
  * (observed in live session/messages payloads: the same id appears at
  * multiple, non-adjacent positions with identical content). Replaying every
