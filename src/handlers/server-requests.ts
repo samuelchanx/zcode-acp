@@ -1133,7 +1133,7 @@ function isUserInputRequestUnchecked(method: string): boolean {
   return method === "interaction/requestUserInput";
 }
 
-/** @see handleOne — the Start Plan captcha-session request (issue #123). */
+/** @see handleOne — the account-provider runtime-headers request (issue #123). */
 function isProviderRuntimeHeadersRequest(method: string): boolean {
   return method === "interaction/requestProviderRuntimeHeaders";
 }
@@ -1173,18 +1173,16 @@ export function answerProviderRuntimeHeaders(
     sendZcodeReply(backend, reqId, { headersApplied: true, requestAuth });
     return true;
   }
-  // Start Plan providers (zcode-plan endpoints) ask their host to solve an
-  // Aliyun captcha and inject X-Aliyun-Captcha-Verify-* headers before every
-  // model request; the desktop renderer does this from a browser environment.
-  // The headless bridge has neither a browser nor the captcha credential, so
-  // the only honest answer is headersApplied:false — the backend then fails
-  // with its -32031 error carrying our message. Without this, the request
-  // fell through to the generic unsupported-request error and the backend
-  // fell back to client signing with the provider's OAuth JWT, dying with the
+  // Account providers the bridge cannot serve: no plan JWT/key in config.json
+  // (e.g. zai-start-plan with an empty key), or a plan whose credentials live
+  // only in the ENCRYPTED store (team/off-peak). The backend then fails with
+  // its -32031 error carrying our message. Without this, the request fell
+  // through to the generic unsupported-request error and the backend fell
+  // back to client signing with the provider's OAuth JWT, dying with the
   // misleading "must contain one separator" invalid-config error (#123).
   warn(
-    "  ⚠ provider runtime headers requested (Start Plan captcha session); " +
-      "the headless bridge cannot provide it — declining",
+    "  ⚠ provider runtime headers requested for an account provider the bridge " +
+      "cannot serve (no usable plan credential in config.json) — declining",
   );
   sendZcodeReply(backend, reqId, {
     headersApplied: false,
@@ -1195,9 +1193,13 @@ export function answerProviderRuntimeHeaders(
 
 /**
  * Reason surfaced through the backend's -32031 error when it asks for a
- * provider runtime headers (Aliyun captcha) refresh we cannot serve.
+ * provider runtime headers refresh we cannot serve. Bigmodel/zai individual
+ * coding plans AND the bigmodel start plan (Weekend Build) are served from
+ * config.json; what remains unservable headless is team/off-peak
+ * (store-encrypted keys) and start plans with no connected account.
  */
 const PROVIDER_RUNTIME_HEADERS_UNAVAILABLE =
-  "Start Plan providers require an Aliyun captcha session that only the " +
-  "ZCode desktop app can provide. Use a GLM Coding Plan provider for " +
-  "headless/editor sessions (see docs/TROUBLESHOOTING.md).";
+  "This account provider's request credentials are not available to the " +
+  "headless bridge (no plan key in ~/.zcode/v2/config.json). Connect the plan " +
+  "in the ZCode desktop app, or use an individual GLM Coding Plan provider " +
+  "(see docs/TROUBLESHOOTING.md).";

@@ -160,7 +160,7 @@ describe("dynamic-workflow flag injection (gate enabled)", () => {
   it("materialization re-sends the / menu after the gate settles enabled (cold-bridge catch-up)", async () => {
     const { server } = makeServer();
     server.backendWorkflowGate = GATE_ENABLED;
-    server.allCommands = [
+    server.buildCommands = () => [
       { name: "workflow", description: "Dynamic workflow" },
       { name: "workflows", description: "List workflows" },
       { name: "quota", description: "Quota" },
@@ -180,7 +180,7 @@ describe("dynamic-workflow flag injection (gate enabled)", () => {
   it("disabled gate → materialization sends no menu catch-up", async () => {
     const { server } = makeServer();
     server.backendWorkflowGate = GATE_DISABLED;
-    server.allCommands = [{ name: "workflow", description: "Dynamic workflow" }];
+    server.buildCommands = () => [{ name: "workflow", description: "Dynamic workflow" }];
     server.pendingSessions.set("sess_menu2", { cwd: "/tmp/ws" });
     menuSends.length = 0;
 

@@ -115,8 +115,10 @@ const PASSTHROUGH_COMMANDS = new Set([
  * Command names the bridge treats as real commands: the static list advertised
  * in the `/` completion menu, backend-resolvable built-ins, TUI-only names
  * (which get a friendly error), and plugin commands. Built lazily on first
- * use (plugin commands don't change mid-session — same freshness as the
- * advertised list in index.ts) so importing this module does no fs work.
+ * use and dropped by resetKnownCommandCache() whenever the advertised list is
+ * rebuilt (buildAllCommands in index.ts — every session open), so importing
+ * this module does no fs work while a skill installed mid-flight is still
+ * picked up at the next rebuild.
  */
 let knownCommands: Set<string> | null = null;
 function knownCommandSet(): Set<string> {
@@ -140,19 +142,26 @@ function knownCommandSet(): Set<string> {
 
 /**
  * Drop the cached known-command set so the next `neutralizeSlashText()` /
- * `handleSlashCommand()` rescan the filesystem. Called whenever the advertised
- * command list is rebuilt (per session open) so a skill installed after the
- * bridge process started is recognised as a real command instead of being
- * zero-width-space neutralised as unknown text.
+ * `handleSlashCommand()` rescan the filesystem. Called by buildAllCommands
+ * (index.ts) on every rebuild of the advertised list (per session open) so a
+ * skill installed after the bridge process started is recognised as a real
+ * command instead of being zero-width-space neutralised as unknown text.
  */
 export function resetKnownCommandCache(): void {
   knownCommands = null;
 }
 
 /**
+ * The current known-command set (built lazily from the filesystem). Exported
+ * for tests asserting the reset/rebuild contract — the behavioral surface is
+ * handleSlashCommand's passthrough decision, which shares this set.
+ */
+export function knownCommandSetForTest(): Set<string> {
+  return knownCommandSet();
+}
+
+/**
  * Wire text for `/`-leading prompts. Identity on 0.16.9 — see below.
- *
- * This used to prefix unknown `/x` prompts with a zero-width space, on the
  *
  * This used to prefix unknown `/x` prompts with a zero-width space, on the
  * reverse-engineered belief that the backend hard-fails a turn whose prompt

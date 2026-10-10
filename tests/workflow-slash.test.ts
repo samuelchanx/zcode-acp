@@ -316,11 +316,11 @@ describe("advertised command menu filter", () => {
 });
 
 describe("resendMenuAfterGateSettled (cold-bridge menu catch-up)", () => {
-  it("enabled gate + allCommands → re-sends the filtered menu for the session's aliases", async () => {
+  it("enabled gate + buildCommands → re-sends the filtered menu for the session's aliases", async () => {
     const server = makeServer();
     await enableGate(server);
     server.registerSession(SID, "zsid_wf");
-    server.allCommands = [
+    server.buildCommands = () => [
       { name: "workflow", description: "Dynamic workflow" },
       { name: "workflows", description: "List workflows" },
       { name: "quota", description: "Quota" },
@@ -341,14 +341,14 @@ describe("resendMenuAfterGateSettled (cold-bridge menu catch-up)", () => {
     );
     server.backendWorkflowGate = gate;
     await gate;
-    server.allCommands = [{ name: "workflow", description: "Dynamic workflow" }];
+    server.buildCommands = () => [{ name: "workflow", description: "Dynamic workflow" }];
     menuSends.length = 0;
 
     resendMenuAfterGateSettled(server, SID);
     expect(menuSends).toHaveLength(0);
   });
 
-  it("allCommands unset (null) → no send", async () => {
+  it("buildCommands unset (null) → no send", async () => {
     const server = makeServer();
     await enableGate(server);
     menuSends.length = 0;

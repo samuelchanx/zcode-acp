@@ -46,7 +46,10 @@ import {
   startQuotaRefresher,
 } from "../quota/live.js";
 import { buildProviderRegistry } from "../config/provider-registry.js";
-import { pushAccountProviderConfig } from "../config/account-provider.js";
+import {
+  configProviderIdFor,
+  pushAccountProviderConfig,
+} from "../config/account-provider.js";
 import { initialSessionMode } from "../config/settings.js";
 import { applyModelSwitch, buildResumeRuntimeModel } from "../config/runtime-model.js";
 import { filterWorkflowCommands, rememberGate, workflowGateNow } from "../config/workflow-gate.js";
@@ -3326,6 +3329,29 @@ async function fetchMessagesForReplay(
 }
 
 /**
+ * Pure decision for repairUnavailableModel: is a persisted selection (the
+ * backend's `settings.model.current`) still served by an enabled provider?
+ *
+ * The backend reads its current model back in the ACCOUNT registry spelling
+ * (`account:<family>-individual-coding-plan`) while the enabled catalog spells
+ * the same plan `builtin:<family>-coding-plan` — an exact providerId
+ * comparison read every account-spelled selection as revoked and downgraded
+ * the session to the first catalog model (observed 2026-10-01 from
+ * ~/.zcode/cli/log/zcode-acp-*.log: GLM-5.3-Flash sessions reverted to
+ * GLM-5.3 whenever a prompt followed an idle gap; the idle gap had evicted
+ * the backend and the respawn reload ran the repair). The comparison accepts
+ * either spelling; only the modelId must be carried by an enabled provider.
+ */
+export function isPersistedModelStillEnabled(
+  available: Array<{ providerId: string; modelId: string }>,
+  cur: { providerId?: string; modelId?: string },
+): boolean {
+  if (!cur?.providerId || !cur.modelId) return true;
+  const spellings = new Set([cur.providerId, configProviderIdFor(cur.providerId)]);
+  return available.some((m) => spellings.has(m.providerId) && m.modelId === cur.modelId);
+}
+
+/**
  * After a faithful resume the session keeps its own last model; when that
  * model no longer belongs to an enabled provider in config.json (deleted or
  * revoked elsewhere), the first send would fail with the backend's
@@ -3353,7 +3379,7 @@ async function repairUnavailableModel(server: ZcodeAcpServer, zcodeSid: string):
     const cur = settings?.model?.current;
     if (!cur?.providerId || !cur.modelId) return;
     const available = loadAllModels();
-    if (available.some((m) => m.providerId === cur.providerId && m.modelId === cur.modelId)) return;
+    if (isPersistedModelStillEnabled(available, cur)) return;
     const fallback = available[0];
     if (!fallback) return;
     warn(

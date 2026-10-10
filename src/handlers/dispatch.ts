@@ -15,6 +15,7 @@ import { configProviderIdFor } from "../config/account-provider.js";
 import { currentModelCached } from "../config/model-cache.js";
 import {
   buildConfigOptions,
+  loadAllModels,
   modelChoiceValue,
   modelContextWindow,
   parseModelValue,
@@ -151,10 +152,17 @@ async function dispatchConfigChanged(
       // Same spelling rule as the advertised choices (bare for unambiguous
       // builtins), with the backend's account-spelling providerId normalized
       // to the config spelling first — a mismatched currentValue reads as
-      // "nothing selected" in client dropdowns.
+      // "nothing selected" in client dropdowns. The model list is passed
+      // EXPLICITLY: the default parameter would silently re-read both config
+      // files on every model event (modelChoiceValue's spelling rule needs
+      // the collision set), and a hidden default read is how call sites drift.
       setById(
         "model",
-        modelChoiceValue(configProviderIdFor(ev.model.providerId), ev.model.modelId),
+        modelChoiceValue(
+          configProviderIdFor(ev.model.providerId),
+          ev.model.modelId,
+          loadAllModels(),
+        ),
       );
     }
     if (ev.mode !== undefined) setById("mode", ev.mode);

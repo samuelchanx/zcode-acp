@@ -24,12 +24,34 @@ Paseo's config-defined ACP integration (`extends: "acp"` in
 Bonus: the model list is always current with `~/.zcode` — including models
 added in the desktop app after the provider was configured.
 
-## Install (run these yourself, not from inside a Paseo-hosted agent)
+## Quota
+
+Two surfaces, one data path — the plugin daemon-side spawns
+`zcode-acp quota --json` (the unified CLI bin; `zcode-acp-server` always starts
+the ACP server and is never used for this):
+
+1. **Native Usage card (Paseo 0.11+).** A usage source maps the GLM Coding
+   Plan windows (5-hour, weekly, MCP tool calls) onto Paseo's built-in Usage
+   screen, with tone thresholds and reset times. Registered defensively, so
+   older daemons just skip it.
+2. **Quota screen.** A sidebar footer item (gauge icon) opens a full screen
+   with every provider the bridge covers — GLM (including per-model MCP
+   detail), Opencode Go, Ollama Cloud — plus reset countdowns and a refresh
+   button (auto-refresh every 60s; the daemon caches 30s).
+
+Binary resolution for the spawn: `ZCODE_ACP_QUOTA_BIN` override, then
+`zcode-acp` on the daemon's PATH, then `~/.local/bin`, `/opt/homebrew/bin`,
+`/usr/local/bin`. Errors degrade to typed unavailable states, never a crash.
+
+Install (run these yourself, not from inside a Paseo-hosted agent)
 
 Plugins are trusted, unsandboxed code in the daemon, and enabling them is
 the operator's decision (`pluginsEnabled` in `~/.paseo/config.json`, applied
 with `paseo reload`). A daemon restart interrupts agents — do it from a
-plain terminal.
+plain terminal. **The same applies to `paseo plugin reload zcode-acp`**: any
+Paseo agent running on this provider (including one you asked to make the
+change) loses its connection mid-reload. Agents may edit source, typecheck,
+and run tests; install/reload is the operator's step.
 
 **Order matters.** The daemon refuses to start a plugin whose provider id is
 already present under `agents.providers` ("Plugin … cannot register
@@ -54,11 +76,27 @@ paseo plugin install "$(pwd)/paseo-plugin"
 paseo reload
 ```
 
-Existing conversations are unaffected: the provider id stays `zcode`
-(not namespaced), so persisted agents validate against the
-plugin-registered provider and resume as before. New agents pick "ZCode"
-from the provider picker. If you ever want the config-defined path back,
-uninstall/disable the plugin first — both cannot own `zcode` at once.
+Existing conversations need a ONE-TIME migration. The provider id stays
+`zcode` (not namespaced), so persisted agents still validate against the
+plugin-registered provider — but the persisted HANDLE format differs: the
+config-defined path stored the raw ACP session id, while the plugin path
+decodes `plugin:{"version":1,"data":{"sessionId":…}}` (daemon
+`PluginAgentClient.decodePersistence`). Without migration, every pre-plugin
+thread fails resume/timeline with `Invalid plugin provider persistence
+handle`. Fix it with the bundled script (rewrites the handles in place,
+per-file backup under `~/.paseo/agents-backup-pre-plugin-migration/`):
+
+```bash
+node paseo-plugin/migrate-legacy-sessions.mjs --dry-run   # inspect first
+node paseo-plugin/migrate-legacy-sessions.mjs
+```
+
+The daemon caches agent records in memory (agent-storage `cache` Map,
+populated at boot), so restart the daemon AFTER migrating — the threads
+resurface on the next boot; the bridge's `session/load` replay finds the same
+backend sessions. New agents pick "ZCode" from the provider picker. If you
+ever want the config-defined path back, uninstall/disable the plugin first —
+both cannot own `zcode` at once.
 
 **If a previous install attempt failed** with `cannot register configured
 provider ID "zcode"`: the plugin entry is already recorded (`plugins` in

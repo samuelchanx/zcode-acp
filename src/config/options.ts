@@ -26,7 +26,7 @@ import {
   zcodePersonalProviderPath,
 } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
-import { configProviderIdFor } from "./account-provider.js";
+import { configProviderIdFor, isStartPlanProviderId } from "./account-provider.js";
 import { isBroadcastSource, sendSessionUpdate, sendSessionUpdateToOthers } from "../handlers/io.js";
 
 interface ProviderModelsJson {
@@ -199,7 +199,15 @@ export interface ModelRef {
  */
 export function providerSelectable(pid: string, p: ProviderEntry | undefined): boolean {
   if (!p) return false;
-  if (isBuiltinProvider(pid)) return p.enabled === true && Boolean(p.options?.apiKey);
+  if (isBuiltinProvider(pid)) {
+    // Start-plan entries: the desktop writes `enabled:false` even while the
+    // plan is the user's active connection — the flag tracks legacy-provider
+    // selection, not start-plan membership (verified 2026-09-30). The plan
+    // JWT's presence is the connection record, mirroring the entitlement rule
+    // in account-provider.ts.
+    if (isStartPlanProviderId(pid)) return Boolean(p.options?.apiKey);
+    return p.enabled === true && Boolean(p.options?.apiKey);
+  }
   if (p.enabled === false) return false;
   if (p.options?.apiKey) return true;
   if (p.options?.apiKeyRequired === false) return true;
@@ -367,17 +375,18 @@ function collidingModelIds(models: ModelRef[]): Set<string> {
 }
 
 function buildModelSelectOptions(models: ModelRef[]): Array<{ value: string; name: string }> {
-  const collidingIds = collidingModelIds(models);
   const options: Array<{ value: string; name: string }> = [];
   const seen = new Set<string>();
   for (const model of models) {
-    const qualify = collidingIds.has(model.modelId) || !isBuiltinProvider(model.providerId);
-    const value = qualify ? formatModelValue(model.providerId, model.modelId) : model.modelId;
+    // modelChoiceValue is the single spelling rule for choices AND
+    // currentValue — an inline duplicate here is how the two drift apart.
+    const value = modelChoiceValue(model.providerId, model.modelId, models);
     if (seen.has(value)) continue;
     seen.add(value);
+    const qualified = value !== model.modelId;
     options.push({
       value,
-      name: qualify ? `${model.providerName} › ${model.modelId}` : model.modelId,
+      name: qualified ? `${model.providerName} › ${model.modelId}` : model.modelId,
     });
   }
   return options;
@@ -385,31 +394,38 @@ function buildModelSelectOptions(models: ModelRef[]): Array<{ value: string; nam
 
 /**
  * Spell a provider+model as an ADVERTISED configOption value (choice or
- * currentValue): the legacy bare modelId while that is unambiguous, qualified
- * `providerId\modelId` when the bare id would be ambiguous (colliding builtin
- * ids across coding plans) or third-party.
+ * currentValue): the legacy bare modelId while this provider is the id's
+ * FIRST builtin holder, qualified `providerId\modelId` for secondary holders
+ * of a colliding id and for third-party providers.
  *
  * Bare is load-bearing for orchestrators: ACP clients such as Paseo validate a
  * REQUESTED model id by exact match against the advertised choice values
  * before sending the switch — an always-qualified encoding makes their stored
  * bare ids fail validation client-side and the session silently keeps the
- * default model (observed 2026-09-26). parseModelValue accepts both spellings
- * inbound, so advertised values round-trip either way.
+ * default model (observed 2026-09-26). So when a second coding plan (start
+ * plan, 2026-09-30) makes an id collide, the FIRST holder keeps the bare
+ * spelling and later holders qualify — which mirrors exactly how
+ * parseModelValue resolves a bare id inbound (first builtin owner wins), so
+ * every stored bare id keeps meaning the same provider it always did.
  */
 export function modelChoiceValue(
   providerId: string,
   modelId: string,
   models: ModelRef[] = loadAllModels(),
 ): string {
-  const ambiguous = collidingModelIds(models).has(modelId) || !isBuiltinProvider(providerId);
+  const firstOwner = models.find((m) => m.modelId === modelId && isBuiltinProvider(m.providerId));
+  const ambiguous =
+    !isBuiltinProvider(providerId) ||
+    (collidingModelIds(models).has(modelId) && firstOwner?.providerId !== providerId);
   return ambiguous ? formatModelValue(providerId, modelId) : modelId;
 }
 
 /**
  * Parse a configOption `value` back into { providerId, modelId }.
  *
- * A value without `\` is a legacy bare modelId → resolve to the first enabled
- * builtin provider. A value with `\` is the current provider+model encoding.
+ * A value without `\` is a legacy bare modelId → resolved to the enabled
+ * provider that OWNS it (see the bare-id branch below). A value with `\` is
+ * the current provider+model encoding.
  */
 export function parseModelValue(value: string): { providerId: string; modelId: string } {
   // New-format (3.12+) agent-definition spelling: `custom:<urlencoded
@@ -425,11 +441,21 @@ export function parseModelValue(value: string): { providerId: string; modelId: s
   }
   const idx = value.indexOf("\\");
   if (idx < 0) {
-    // Builtin plain modelId — resolve to the first enabled builtin provider
-    // (falling back to the legacy default if none configured).
-    const firstBuiltin = loadAllModels().find((m) => isBuiltinProvider(m.providerId));
+    // Bare modelId — resolve to the enabled provider that CARRIES it, not
+    // the first enabled builtin: with two enabled plans, a model unique to
+    // the second is still advertised bare (only colliding ids qualify), and
+    // attributing it to the first plan makes applyModelSwitch fail with
+    // "Provider Registry 中不存在 Model" — the selected-model-not-applied
+    // shape. Builtin owners win the lookup (bare ids are only advertised
+    // for builtins); unknown ids keep the first-builtin fallback so the
+    // switch surfaces the registry's own error.
+    const models = loadAllModels();
+    const owner =
+      models.find((m) => m.modelId === value && isBuiltinProvider(m.providerId)) ??
+      models.find((m) => m.modelId === value);
+    const firstBuiltin = models.find((m) => isBuiltinProvider(m.providerId));
     return {
-      providerId: firstBuiltin?.providerId ?? DEFAULT_PROVIDER_ID,
+      providerId: owner?.providerId ?? firstBuiltin?.providerId ?? DEFAULT_PROVIDER_ID,
       modelId: value,
     };
   }

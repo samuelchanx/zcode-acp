@@ -36,6 +36,26 @@ import { log, warn, ZCODE_CREDS_PATH } from "../utils.js";
 /** The bundled provider-table file the CLI boots from. */
 const PROVIDER_CONFIG_NAME = "zcode-builtin.json";
 
+/**
+ * The plan spellings a `builtin:<family>-<plan>` config.json id can carry, and
+ * the `mode` the bundled table names them. `coding-plan` is the LEGACY
+ * config.json spelling of the individual plan; start-plan is spelled the same
+ * in both.
+ */
+function builtinPlanSlug(providerId: string): { family: string; plan: string } | null {
+  if (!providerId.startsWith("builtin:")) return null;
+  const slug = providerId.slice("builtin:".length); // e.g. "bigmodel-start-plan"
+  // "<family>-<plan>" — split on the FIRST dash so multi-hyphen families survive.
+  const dash = slug.indexOf("-");
+  if (dash <= 0) return null;
+  return { family: slug.slice(0, dash), plan: slug.slice(dash + 1) };
+}
+
+/** True for `builtin:<family>-start-plan` ids (the ZCode-only plan family). */
+export function isStartPlanProviderId(providerId: string): boolean {
+  return builtinPlanSlug(providerId)?.plan === "start-plan";
+}
+
 /** One provider rule in the bundled table. */
 interface BuiltinProviderRule {
   providerId: string;
@@ -122,15 +142,13 @@ export function accountProviderIdFor(providerId: string): string {
     readBuiltinTable()?.table.config?.providerConfigRules?.providerRules?.filter(
       (r) => r.config?.access?.type === "zhipu-account",
     ) ?? [];
-  const slug = providerId.slice("builtin:".length); // e.g. "bigmodel-coding-plan"
-  // "<family>-<plan>" — split on the FIRST dash so multi-hyphen families survive.
-  const dash = slug.indexOf("-");
-  if (dash <= 0) return providerId;
-  const family = slug.slice(0, dash);
-  let plan = slug.slice(dash + 1); // "coding-plan" | "start-plan"
+  const parsed = builtinPlanSlug(providerId);
+  if (!parsed) return providerId;
+  let plan = parsed.plan;
   if (plan === "coding-plan") plan = "individual-coding-plan";
   const hit = rules.find(
-    (r) => r.config?.access?.accountType === family && r.config?.access?.mode === plan,
+    (r) =>
+      r.config?.access?.accountType === parsed.family && r.config?.access?.mode === plan,
   );
   return hit?.providerId ?? providerId;
 }
@@ -149,11 +167,14 @@ export function configProviderIdFor(providerId: string): string {
   }
   // Table-absent fallback (headless Linux: no desktop app bundle to read).
   // The account/config id spellings are a stable convention —
-  // `account:<family>-(individual-|team-|start-)?coding-plan` →
-  // `builtin:<family>-coding-plan` — so model-limit lookups keep working
-  // without the table. Unknown shapes pass through unchanged.
-  const m = /^account:([a-z0-9]+)-(?:(?:individual|team|start)-)?coding-plan$/.exec(providerId);
-  return m ? `builtin:${m[1]}-coding-plan` : providerId;
+  // `account:<family>-(individual-|team-)?coding-plan` → `builtin:<family>-coding-plan`
+  // and `account:<family>-start-plan` → `builtin:<family>-start-plan` — so
+  // model-limit lookups keep working without the table. Unknown shapes pass
+  // through unchanged.
+  const m =
+    /^account:([a-z0-9]+)-(?:(?:individual|team)-)?(?:coding|start)-plan$/.exec(providerId);
+  if (!m) return providerId;
+  return `builtin:${m[1]}-${providerId.endsWith("-start-plan") ? "start-plan" : "coding-plan"}`;
 }
 
 /**
@@ -193,13 +214,28 @@ function entitledBuiltinProviders(): Set<string> {
     // cache absent/unreadable — the other sources decide
   }
   // 2) Legacy config.json (still the app's own provider enablement).
+  //    Start-plan entries are the documented exception to the `enabled` gate:
+  //    the desktop writes `enabled:false` there EVEN WHILE the plan is the
+  //    user's active connection (observed 2026-09-30: an active Weekend Build
+  //    start plan sat at enabled=false) — the flag tracks legacy-provider
+  //    selection, not start-plan membership. Presence of the plan JWT
+  //    (`options.apiKey`, the same `zcodejwttoken` the desktop serves as
+  //    requestAuth — desktop source accountProviderRequestAuthService.ts
+  //    answers start-plan with `{apiKey: zcodeJwtToken}`) IS the connection
+  //    record, mirroring the standalone rule "credential present → entitled".
+  //    A lapsed plan still passes this gate; the failure then surfaces at
+  //    request time as the backend's own quota/entitlement error instead of a
+  //    missing-dropdown mystery.
   try {
     const cfg = JSON.parse(readFileSync(ZCODE_CREDS_PATH, "utf8")) as {
       provider?: Record<string, { enabled?: boolean; options?: { apiKey?: string } }>;
     };
     for (const [pid, p] of Object.entries(cfg.provider ?? {})) {
       if (!pid.startsWith("builtin:")) continue;
-      if (p?.enabled === true && p.options?.apiKey) out.add(pid);
+      const hasKey = Boolean(p?.options?.apiKey);
+      if ((p?.enabled === true && hasKey) || (isStartPlanProviderId(pid) && hasKey)) {
+        out.add(pid);
+      }
     }
   } catch {
     // unreadable config — the other sources decide
@@ -234,11 +270,18 @@ function entitledBuiltinProviders(): Set<string> {
  * suppliers are the desktop host and the CLI's own "standalone" credential
  * pair, whose identity half this machine never wrote — the api-key half sits
  * in the CLI's ENCRYPTED credential store, unreadable here). The desktop
- * answers with the plan's API key; the bridge can serve the same plan's key
- * from legacy config.json — the same key the pre-3.12 `builtin:` provider of
- * that plan used. Only the individual coding plan is served: start-plan needs
- * an Aliyun captcha (stays refused, issue #123), and team/off-peak keys are
- * store-encrypted.
+ * answers with the plan's request material; the bridge serves the same:
+ *
+ *  - individual coding plan: the plan's API key from legacy config.json (the
+ *    same key the pre-3.12 `builtin:` provider used);
+ *  - start plan: the plan JWT from the same config.json entry — desktop source
+ *    (v3.14.3, accountProviderRequestAuthService.ts) answers start-plan with
+ *    `{apiKey: tokenSet.zcodeJwtToken}` and NO headers; the Aliyun captcha the
+ *    old bundle layered on top is gone server-side, and `zcodejwttoken` in the
+ *    credential store is byte-identical to this config.json value (verified
+ *    2026-09-30). This mirrors what the desktop host does — no captcha is
+ *    solved or bypassed, the gateway simply no longer demands one.
+ *  - team/off-peak keys are store-encrypted: not servable.
  */
 export function codingPlanRequestAuthFor(
   accountProviderId: string | undefined,
@@ -247,7 +290,8 @@ export function codingPlanRequestAuthFor(
   const rule = readBuiltinTable()?.table.config?.providerConfigRules?.providerRules?.find(
     (r) => r.providerId === accountProviderId,
   );
-  if (rule?.config?.access?.mode !== "individual-coding-plan") return null;
+  const mode = rule?.config?.access?.mode ?? planModeFromAccountId(accountProviderId);
+  if (mode !== "individual-coding-plan" && mode !== "start-plan") return null;
   const legacyId = configProviderIdFor(accountProviderId);
   if (legacyId === accountProviderId) return null;
   if (!entitledBuiltinProviders().has(legacyId)) return null;
@@ -260,6 +304,19 @@ export function codingPlanRequestAuthFor(
   } catch {
     return null;
   }
+}
+
+/**
+ * The plan mode for an `account:*` id, derived from the id spelling alone —
+ * the table-absent fallback (headless Linux: no desktop bundle to read) for
+ * callers that need the mode to route behavior. Mirrors the fallback
+ * convention in `configProviderIdFor`:
+ * `account:<family>-(individual|team|start)-…plan`. Unknown shapes → null.
+ */
+function planModeFromAccountId(providerId: string): string | null {
+  const m = /^account:[a-z0-9]+-(individual|team|start)-(?:coding-)?plan$/.exec(providerId);
+  if (!m) return null;
+  return m[1] === "individual" ? "individual-coding-plan" : `${m[1]}-plan`;
 }
 
 /** The `provider/updateAccountConfig` payload (schema-verified shape). */ export interface AccountProviderPayload {

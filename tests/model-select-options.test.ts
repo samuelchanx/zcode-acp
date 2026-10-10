@@ -18,6 +18,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ZCODE_CREDS_PATH } from "../src/utils.js";
 import { ZcodeAcpServer } from "../src/server.js";
+import { isPersistedModelStillEnabled } from "../src/handlers/session.js";
 
 function codingPlan(name: string, baseURL: string) {
   return {
@@ -87,9 +88,20 @@ describe("model configOptions uniqueness", () => {
       { providerId: "builtin:zai-start-plan", modelId: "GLM-5.3" },
       { providerId: "builtin:zai-start-plan", modelId: "GLM-5.3-Flash" },
     ]);
+    // First-owner-bare (2026-09-30): the primary plan keeps the bare spelling
+    // so stored bare ids (Paseo agents, editor session state) keep matching —
+    // the qualified spelling disambiguates only the SECONDARY holder. Names
+    // follow the value shape: bare values show the modelId, qualified values
+    // show "provider › model".
+    expect(model?.options.map((option) => option.value)).toEqual([
+      "GLM-5.3",
+      "GLM-5.3-Flash",
+      "builtin:zai-start-plan\\GLM-5.3",
+      "builtin:zai-start-plan\\GLM-5.3-Flash",
+    ]);
     expect(model?.options.map((option) => option.name)).toEqual([
-      "Z.ai - Coding Plan › GLM-5.3",
-      "Z.ai - Coding Plan › GLM-5.3-Flash",
+      "GLM-5.3",
+      "GLM-5.3-Flash",
       "Z.ai - Start Plan › GLM-5.3",
       "Z.ai - Start Plan › GLM-5.3-Flash",
     ]);
@@ -127,17 +139,131 @@ describe("model configOptions uniqueness", () => {
     );
   });
 
-  it("qualifies colliding builtin ids so values stay unique per plan", async () => {
-    // Colliding plans keep the #175 disambiguation: both plans ship GLM-5.3,
-    // so the bare id would be ambiguous and the qualified spelling is
-    // required for uniqueness.
+  it("qualifies only the SECONDARY holder of a colliding builtin id", async () => {
+    // Colliding plans stay unambiguous: the first holder advertises bare
+    // (its stored ids keep matching), later holders qualify (2026-09-30,
+    // first-owner-bare — supersedes the all-qualified rule from #175).
     const options = await buildConfigOptions(new ZcodeAcpServer(), null);
     const model = options.find((option) => option.id === "model");
     const values = model?.options.map((option) => option.value) ?? [];
 
-    expect(values).toContain("builtin:zai-coding-plan\\GLM-5.3");
+    expect(values).toContain("GLM-5.3");
+    expect(values).toContain("GLM-5.3-Flash");
     expect(values).toContain("builtin:zai-start-plan\\GLM-5.3");
-    expect(values).not.toContain("GLM-5.3");
-    expect(values).not.toContain("GLM-5.3-Flash");
+    expect(values).toContain("builtin:zai-start-plan\\GLM-5.3-Flash");
+    expect(values).not.toContain("builtin:zai-coding-plan\\GLM-5.3");
+    // Uniqueness — the invariant #175 was about — still holds.
+    expect(values).toEqual([...new Set(values)]);
+  });
+
+  it("resolves a bare id unique to the second enabled plan to ITS provider (ownership, not order)", () => {
+    // Two enabled plans with disjoint extra models: GLM-4.7 exists only on
+    // the start plan, so it is advertised BARE (no collision) — but
+    // resolving it to the first enabled builtin (the old rule) sent the
+    // switch to the coding plan and failed with "Provider Registry 中不
+    // 存在 Model": the selected-model-not-applied shape.
+    fakeConfig = {
+      provider: {
+        "builtin:zai-coding-plan": codingPlan(
+          "Z.ai - Coding Plan",
+          "https://api.z.ai/api/anthropic",
+        ),
+        "builtin:zai-start-plan": {
+          ...codingPlan("Z.ai - Start Plan", "https://zcode.z.ai/api/v1/zcode-plan/anthropic"),
+          models: {
+            "GLM-5.3": { limit: { context: 200000 } },
+            "GLM-4.7": { limit: { context: 128000 } },
+          },
+        },
+      },
+    };
+
+    expect(parseModelValue("GLM-4.7")).toEqual({
+      providerId: "builtin:zai-start-plan",
+      modelId: "GLM-4.7",
+    });
+    // Models on the FIRST plan still resolve to it, and colliding ids keep
+    // the first-owner tiebreak.
+    expect(parseModelValue("GLM-5.3")).toEqual({
+      providerId: "builtin:zai-coding-plan",
+      modelId: "GLM-5.3",
+    });
+  });
+
+  it("falls back to the first enabled builtin for a bare id no provider carries", () => {
+    // Unknown ids keep the legacy fallback so applyModelSwitch surfaces the
+    // registry's own error instead of the bridge inventing one.
+    fakeConfig = {
+      provider: {
+        "builtin:zai-coding-plan": codingPlan(
+          "Z.ai - Coding Plan",
+          "https://api.z.ai/api/anthropic",
+        ),
+      },
+    };
+
+    expect(parseModelValue("GLM-9.9")).toEqual({
+      providerId: "builtin:zai-coding-plan",
+      modelId: "GLM-9.9",
+    });
+  });
+});
+
+/**
+ * repairUnavailableModel compares the session's persisted model against the
+ * enabled catalog. The backend reports its current model in the account
+ * registry spelling (`account:<family>-individual-coding-plan`), the catalog
+ * spells the same plan `builtin:<family>-coding-plan`; an exact-provider
+ * comparison read that as "no longer enabled" and silently downgraded idle
+ * sessions to the first catalog model (observed: GLM-5.3-Flash sessions
+ * reverted to GLM-5.3 whenever a prompt followed an idle gap — the backend
+ * respawned, the reload ran the repair). The comparison must accept either
+ * spelling (verified 2026-10-01 from ~/.zcode/cli/log/zcode-acp-*.log).
+ */
+describe("isPersistedModelStillEnabled", () => {
+  const catalog = [
+    {
+      providerId: "builtin:bigmodel-coding-plan",
+      providerName: "GLM Coding Plan",
+      modelId: "GLM-5.3",
+    },
+    {
+      providerId: "builtin:bigmodel-coding-plan",
+      providerName: "GLM Coding Plan",
+      modelId: "GLM-5.3-Flash",
+    },
+    {
+      providerId: "builtin:bigmodel-start-plan",
+      providerName: "GLM Start Plan",
+      modelId: "GLM-5.3-Flash",
+    },
+  ];
+
+  it("accepts the backend account spelling of a configured plan (" +
+    "`account:<family>-individual-coding-plan` vs catalog `builtin:<family>-coding-plan`)", () => {
+    expect(
+      isPersistedModelStillEnabled(catalog, {
+        providerId: "account:bigmodel-individual-coding-plan",
+        modelId: "GLM-5.3-Flash",
+      }),
+    ).toBe(true);
+  });
+
+  it("accepts the exact config spelling unchanged", () => {
+    expect(
+      isPersistedModelStillEnabled(catalog, {
+        providerId: "builtin:bigmodel-start-plan",
+        modelId: "GLM-5.3-Flash",
+      }),
+    ).toBe(true);
+  });
+
+  it("downgrades only when no enabled provider carries the model under either spelling", () => {
+    expect(
+      isPersistedModelStillEnabled(catalog, {
+        providerId: "account:bigmodel-individual-coding-plan",
+        modelId: "GLM-9.9",
+      }),
+    ).toBe(false);
   });
 });

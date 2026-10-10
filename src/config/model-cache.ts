@@ -8,6 +8,7 @@
  */
 
 import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 
@@ -26,6 +27,29 @@ import { log } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { dispatchEvent } from "../handlers/dispatch.js";
 import type { ProjectionDiffer } from "../translators/projection-differ.js";
+
+type DatabaseSyncCtor = (typeof import("node:sqlite"))["DatabaseSync"];
+
+/**
+ * Loaded through `createRequire` rather than a dynamic `import`: under vite
+ * (the test runner) `import("node:sqlite")` is intercepted and fails to
+ * resolve, which would silently disable the resume fallback in every test
+ * (same lesson as settings/usage-stats.ts). `require` resolves Node built-ins
+ * directly; null when the runtime lacks node:sqlite (the caller degrades to
+ * "no bar until first turn", not a module-load failure).
+ */
+let sqliteCtor: DatabaseSyncCtor | null | undefined;
+
+function loadSqlite(): DatabaseSyncCtor | null {
+  if (sqliteCtor !== undefined) return sqliteCtor;
+  try {
+    const require = createRequire(import.meta.url);
+    sqliteCtor = (require("node:sqlite") as { DatabaseSync: DatabaseSyncCtor }).DatabaseSync;
+  } catch {
+    sqliteCtor = null;
+  }
+  return sqliteCtor;
+}
 
 /**
  * Read the session's current model as an encoded `"providerId\modelId"` string,
@@ -60,29 +84,29 @@ export async function currentModelCached(
 }
 
 /**
- * Last completed model request's context size from the zcode store
+ * Newest completed model request's context size from the zcode store
  * (`~/.zcode/cli/db/db.sqlite`, override with `ZCODE_USAGE_DB`). One TURN makes
  * many model requests (one per tool-call round-trip), each re-sending the whole
  * context — so the turn-level `turn_usage.computed_total_tokens` SUMS them and
  * runs far past the window on agentic turns (observed 22.7M on a 1M model).
  * `model_usage` is per request; its newest completed row's
  * `computed_total_tokens` (input + output of that single request) IS the
- * context size as of the end of the last turn.
+ * context size as of the end of the last turn. The turn aggregate serves only
+ * as a fallback when the session has no completed model_usage row (pre-
+ * model_usage stores, or requests that never completed).
  * Read-only + WAL: safe alongside a live backend. Returns 0 when the store is
- * missing, the runtime lacks `node:sqlite`, or the session has no turns yet.
+ * missing, the runtime lacks `node:sqlite`, or the session has no usable rows.
  */
-async function lastTurnContextUsed(zcodeSid: string): Promise<number> {
+export async function lastRequestContextUsed(zcodeSid: string): Promise<number> {
   const dbPath =
     process.env.ZCODE_USAGE_DB || path.join(os.homedir(), ".zcode", "cli", "db", "db.sqlite");
-  if (!existsSync(dbPath)) return 0;
+  const Sqlite = loadSqlite();
+  if (!Sqlite || !existsSync(dbPath)) return 0;
   try {
-    // Dynamic import: a runtime without `node:sqlite` must degrade to the old
-    // "no bar until first turn" behavior, not fail the module load.
-    const { DatabaseSync } = await import("node:sqlite");
-    const db = new DatabaseSync(dbPath, { readOnly: true });
+    const db = new Sqlite(dbPath, { readOnly: true });
     try {
       // Per-request truth first; the turn-level aggregate is a coarse
-      // fallback for stores without model_usage rows.
+      // fallback when no completed model_usage row exists.
       const row = db
         .prepare(
           `SELECT (
@@ -103,7 +127,7 @@ async function lastTurnContextUsed(zcodeSid: string): Promise<number> {
       db.close();
     }
   } catch (e) {
-    log(`model-cache: turn_usage fallback failed (${e instanceof Error ? e.message : String(e)})`);
+    log(`model-cache: usage store read failed (${e instanceof Error ? e.message : String(e)})`);
     return 0;
   }
 }
@@ -130,10 +154,11 @@ export async function emitInitialUsage(
     const read = await sessionRead(server, zcodeSid);
     const proj = (read.projection ?? {}) as { contextUsed?: number; contextWindow?: number };
     // Occupancy only (#228): totalTokenCount is lifetime consumption — never
-    // a context meter. contextUsed absent/0 → fall back to the store's last
-    // completed turn, which re-sent the full context (see lastTurnContextUsed).
+    // a context meter. contextUsed absent/0 → fall back to the store's newest
+    // completed model request, which re-sent the full context (see
+    // lastRequestContextUsed).
     let used = proj.contextUsed ?? 0;
-    if (!used) used = await lastTurnContextUsed(zcodeSid);
+    if (!used) used = await lastRequestContextUsed(zcodeSid);
     if (!used) return; // resume before any turn: skip to avoid showing 0.
     // Configured limit wins over the projection's contextWindow — the
     // projection seeds a hardcoded 200K default for models without registry

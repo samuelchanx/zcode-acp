@@ -104,8 +104,10 @@ account provider. A `headersApplied:false` answer makes the turn fail with
 -32031 and retry. The bridge (0.42.5+) answers with the coding plan's API key
 from `~/.zcode/v2/config.json` (`codingPlanRequestAuthFor`) — if sends still
 fail, check that the enabled `builtin:bigmodel-coding-plan` entry carries a
-non-empty `options.apiKey` in that file. Start-plan providers stay declined
-(Aliyun captcha — desktop app only, issue #123).
+non-empty `options.apiKey` in that file. The bigmodel start plan is served the
+same way (its `builtin:bigmodel-start-plan` entry's JWT); team/off-peak plans
+and keyless start plans stay declined (store-encrypted / missing credentials,
+issue #123 history).
 
 ### Authentication / credential errors (401, provider auth failed)
 
@@ -481,34 +483,33 @@ non-growing reads, capped). The bridge log line
 unconditionally — a first-entry total below the session's real size was the
 signature of this bug.
 
-### Start Plan (zcode-plan) providers fail headless — 1113 / signing errors
+### Start Plan (zcode-plan) providers — supported since 0.49.0 (Weekend Build)
 
-**Symptom:** every turn fails with HTTP 429 error `1113` ("Insufficient
-balance or no resource package") or `ClientRequestSigningV4Error: Client
-signing credential must contain one separator`, while the same account works
-in the ZCode desktop app.
-
-**Cause:** Start Plan providers (`builtin:zai-start-plan`,
+**History:** Start Plan providers (`builtin:zai-start-plan`,
 `builtin:bigmodel-start-plan`, baseURL `zcode.z.ai/api/v1/zcode-plan/...`)
-authenticate with the provider's OAuth JWT **plus an Aliyun captcha session**:
-before each model request the backend asks its host via
-`interaction/requestProviderRuntimeHeaders` to solve an Aliyun captcha and
-inject `X-Aliyun-Captcha-Verify-Param`/`-Region` headers. The desktop app
-solves this in its renderer (browser environment, mostly invisible); a
-headless bridge has neither a browser nor the captcha credential. GLM Coding
-Plan providers are unaffected — they use an `id.secret` API key and sign
-requests themselves.
+used to fail headless (#123) with `1113` or signing errors: the gateway
+demanded an Aliyun captcha session per request, and only the desktop
+renderer could produce it.
 
-**Workaround:** switch the session's provider to a GLM Coding Plan one
-(model dropdown, or re-enable it in the desktop app so
-`~/.zcode/v2/config.json` marks it `enabled`). The bridge answers the captcha
-request with `headersApplied:false` and the backend surfaces a clear error;
-full Start Plan support headless would require solving the Aliyun captcha
-outside a browser, which this bridge does not do. That boundary is
-deliberate: unofficial clients or proxies that impersonate the desktop app or
-bypass the captcha check won't be shipped or supported here — if the provider
-ever offers an official headless credential path, this bridge will adopt it
-(see #123).
+**Now:** ZCode removed the captcha gate (desktop ≥ 3.14.4; source-confirmed in
+the open repo, `accountProviderRequestAuthService.ts` — the host answers
+start-plan requests with just `{apiKey: zcodeJwtToken}`, no headers). The
+bridge mirrors the desktop: the bigmodel start plan's JWT is served from
+`~/.zcode/v2/config.json` (`builtin:bigmodel-start-plan` → `options.apiKey`),
+and its models appear in the dropdown qualified as
+`builtin:bigmodel-start-plan\GLM-5.3[-Flash]` (the individual plan keeps the
+bare ids). No captcha is solved or bypassed — the gateway no longer asks for
+one.
+
+**Requirements:** the plan JWT must exist in config.json (connect the start
+plan once in the desktop app). `zai-start-plan` entries with an empty key, and
+team/off-peak plans (store-encrypted keys), stay unservable — those answer
+`headersApplied:false` with an actionable error.
+
+**`1005 exceed quota limit`:** the gateway's own business verdict, not a
+bridge failure — the Weekend Build promo balance is exhausted or outside its
+use window (the windows are weekend-bounded). Check the balance in the desktop
+app; retry inside the window.
 
 ### Paseo: no context-window meter for ACP providers / no effort selector
 
@@ -521,7 +522,15 @@ already exists under `agents.providers` in the daemon config
 ("cannot register configured provider ID") — the entry must be DELETED
 before the plugin starts (presence-based; `enabled: false` does not
 suffice), and must not be re-added later (the check re-runs at every boot).
-The notes below explain the gaps in the config-defined path and stay as
+A second, post-install rule bites on the FIRST resume of a pre-plugin
+thread: `Invalid plugin provider persistence handle`. The config-defined
+path persisted the raw ACP session id; the plugin path requires the
+`plugin:{"version":1,"data":{"sessionId":…}}` envelope
+(`PluginAgentClient.decodePersistence`). Migrate the old agent records with
+`node paseo-plugin/migrate-legacy-sessions.mjs` (backed up, in-place), then
+restart the daemon — agent records are cached in memory from boot, so the
+running daemon never sees the rewritten files until then. The notes below
+explain the gaps in the config-defined path and stay as
 the diagnosis for why the plugin exists:
 
 The bridge emits spec-clean `usage_update {used, size}` on every path

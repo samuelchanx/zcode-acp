@@ -11,7 +11,15 @@ This repo's issues and PRDs live in GitHub issues. All operations use the `gh` C
 - **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
 - **Close**: `gh issue close <number> --comment "..."`
 
-The repo is inferred from `git remote -v`; when running inside a clone, `gh` handles this automatically.
+**Always pass the repo explicitly** (`-R samuelchanx/zcode-acp`).
+This clone has two GitHub remotes — `origin` (samuelchanx/zcode-acp, the
+project tracker) and `upstream` (william0wang/zcode-acp, someone else's) —
+and `gh` prefers the `upstream` remote when both exist, so bare `gh issue …`
+commands land on the wrong tracker silently (observed 2026-09-30: a spec
+issue was published upstream by accident). **Never create issues on
+upstream** (ruling 2026-09-30). The fork's issue tracker is the project
+tracker (enabled 2026-09-30) and carries the five canonical triage labels;
+samuelchanx owns it, so labels and edits work without permission issues.
 
 ## When a skill says "publish to the issue tracker"
 

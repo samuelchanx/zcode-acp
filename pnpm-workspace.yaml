@@ -2,5 +2,9 @@ allowBuilds:
   esbuild: true
 minimumReleaseAgeExclude:
   - zcode-acp-martty@0.2.39-zcode.5
+  - '@getpaseo/client@0.11.2'
+  - '@getpaseo/plugin@0.11.2'
+  - '@getpaseo/protocol@0.11.2'
+  - '@getpaseo/relay@0.11.2'
 onlyBuiltDependencies:
   - esbuild

@@ -9,11 +9,13 @@ methods and streams events back as ACP `session/update` notifications.
 
 ## ZCode upstream source (open-sourced 2026-09)
 
-ZCode went open source (Apache-2.0): a local checkout lives at
-`~/Develop/NoBackup/ZCode` (remote `github.com/zai-org/ZCode`; synced to
-desktop 3.14.3 = app-server/`apps/zcode-cli` 0.16.9 — same version the bridge
-runs today; the 3.14.3 release was workflow-internal only, see
-docs/BACKLOG.md). The agent runtime is under `apps/zcode-cli/packages/core/`;
+ZCode went open source (Apache-2.0), remote `github.com/zai-org/ZCode`
+(synced to desktop 3.14.3 = app-server/`apps/zcode-cli` 0.16.9 — same version
+the bridge runs today; the 3.14.3 release was workflow-internal only, see
+docs/BACKLOG.md). **The local checkout at `~/Develop/NoBackup/ZCode` was
+removed from disk (verified 2026-09-27)** — re-clone it there before trusting
+the key map below: `git clone git@github.com:zai-org/ZCode.git
+~/Develop/NoBackup/ZCode`. The agent runtime is under `apps/zcode-cli/packages/core/`;
 `packages/zcode-server-cli` is only a thin CLI shell. **Read the source BEFORE
 probing or reverse-engineering the bundled CLI** — every "verified against
 app-server" note in Gotchas below predates it and now has an authoritative
@@ -30,7 +32,7 @@ reference. Key map:
   entitlement
 - `packages/desktop/` — the Electron host (provider env injection, TCC, v4)
 
-**On every backend version bump**: `git -C ~/Develop/NoBackup/ZCode pull` (or
+**On every backend version bump**: clone/pull `~/Develop/NoBackup/ZCode` (or
 fetch the matching tag), re-read `packages/shared/src/zcode-protocol/index.ts`
 for schema drift, and diff the behaviors Gotchas depends on (stop, provider
 bootstrap, runtime headers, compact, setModel strictness) against the source
@@ -241,8 +243,10 @@ ZCode protocol types into ACP notifications directly — always translate.
   bridge answers `headersApplied:true, requestAuth:{apiKey}` with the plan's
   config.json key for individual coding plans
   (`answerProviderRuntimeHeaders`, server-requests.ts) — the same key the
-  pre-3.12 `builtin:` provider used; start-plan stays declined (Aliyun
-  captcha, #123). **The answer is wired at frame ARRIVAL**
+  pre-3.12 `builtin:` provider used; the bigmodel start plan (Weekend Build)
+  is served the same way since 2026-09-30 — its `builtin:bigmodel-start-plan`
+  config.json JWT, no captcha (ZCode removed the gate server-side; see the
+  Start Plan bullet below and ADR-0008). **The answer is wired at frame ARRIVAL**
   (`ZcodeBackend.providerRuntimeHeadersResponder`, set in ensureBackend), not
   just the turn-loop queue: a headers ask that lands while no turn loop is
   polling — compact's internal turn above all — used to sit unanswered until
@@ -653,15 +657,27 @@ permitted` (#127); the slave allow is extension-gated (`require-all` +
   restart channel from inside such a session is an `open` one (e.g. Warp's
   `warp://action/new_tab?path=<restart.command>`), which hands execution to a
   clean user shell.
-- **Start Plan providers are desktop-only — do NOT "fix" this with an
-  unofficial provider client**: `zcode-plan` requests need an Aliyun captcha
-  session only the desktop renderer can provide; the bridge answers
-  `interaction/requestProviderRuntimeHeaders` with `headersApplied:false` +
-  an actionable error (PR #128). Impersonating the desktop client, bypassing
-  the captcha/signing anti-abuse measures, or copying from the unlicensed
-  third-party proxies that do this are legal no-gos for a distributed tool
-  (ADR-0019) — decline the feature request and point users at GLM Coding
-  Plan or the desktop app.
+- **Start Plan (Weekend Build) is SERVED headless since 2026-09-30 — the
+  captcha era ended server-side** (supersedes the old #123/PR #128 decline;
+  ADR-0008): ZCode ≥ 3.14.4 removed the Aliyun captcha gate — the desktop
+  host now auto-answers `interaction/requestProviderRuntimeHeaders` for
+  start-plan with just `{apiKey: zcodeJwtToken}` and NO headers (source
+  v3.14.3: `accountProviderRequestAuthService.ts:73-76`; zcodeAgentService
+  comment "Start Plan JWT 都不需要 Renderer 交互"). The bridge mirrors it:
+  `codingPlanRequestAuthFor` serves the `builtin:bigmodel-start-plan`
+  config.json JWT (byte-identical to the store's `zcodejwttoken` — verified
+  2026-09-30), `entitledBuiltinProviders`/`providerSelectable` admit the
+  entry on JWT PRESENCE alone — the desktop writes `enabled:false` on
+  start-plan entries even while the plan is the ACTIVE connection, so the
+  flag is not a start-plan signal. Do NOT re-add a captcha-style refusal for
+  bigmodel start-plan, and do NOT "solve" captchas if Z.AI ever reinstates
+  them — the old boundary stands: impersonating the client or bypassing
+  anti-abuse measures stays a no-go; the legitimate trigger was the official
+  credential path, which is what config.json's JWT now is. Still unservable:
+  zai-start-plan with an empty key, team/off-peak (store-encrypted).
+  Verified live 2026-09-30: models advertise, switch applies, the gateway
+  answers with its own business code (`1005 exceed quota limit` when the
+  Weekend Build balance is spent/out of window — weekend-bounded windows).
 - **ACP wire method names are snake_case** (`session/request_permission`,
   not `session/requestPermission`) — the camelCase spelling is silently
   method-not-found (-32601) on real clients, and an `as never` param cast

@@ -1,14 +1,18 @@
 /**
- * Provider runtime headers (Start Plan captcha session) — issue #123.
+ * Provider runtime headers — issue #123.
  *
- * Start Plan providers (zcode-plan endpoints) ask their host via
- * `interaction/requestProviderRuntimeHeaders` to solve an Aliyun captcha and
- * inject X-Aliyun-Captcha-Verify-* headers; only the desktop renderer can.
- * The bridge must answer `headersApplied:false` with a clear reason so the
- * backend fails with its -32031 error — NOT fall through to the generic
- * unsupported-request error, which made the backend fall back to client
- * signing with the provider's OAuth JWT and die with the misleading
- * "must contain one separator" invalid-config error.
+ * Account-plan providers ask their host via
+ * `interaction/requestProviderRuntimeHeaders` before EVERY model request.
+ * The bridge serves what the desktop serves (v3.14.3 source,
+ * accountProviderRequestAuthService.ts): the individual plan's API key and
+ * the start plan's JWT — both straight from config.json, no captcha involved
+ * (the Aliyun captcha layer the old bundle solved is gone server-side).
+ * Providers with no usable config.json credential (team/off-peak,
+ * never-provisioned start plans) must get `headersApplied:false` with a clear
+ * reason so the backend fails with its -32031 error — NOT fall through to the
+ * generic unsupported-request error, which made the backend fall back to
+ * client signing and die with the misleading "must contain one separator"
+ * invalid-config error.
  */
 
 import type * as acp from "@agentclientprotocol/sdk";
@@ -27,9 +31,11 @@ vi.mock("../src/config/account-provider.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/config/account-provider.js")>();
   return {
     ...actual,
-    codingPlanRequestAuthFor: vi.fn((providerId: string | undefined): { apiKey: string } | null =>
-      providerId === "account:bigmodel-individual-coding-plan" ? { apiKey: "test-key" } : null,
-    ),
+    codingPlanRequestAuthFor: vi.fn((providerId: string | undefined): { apiKey: string } | null => {
+      if (providerId === "account:bigmodel-individual-coding-plan") return { apiKey: "test-key" };
+      if (providerId === "account:bigmodel-start-plan") return { apiKey: "start-plan-jwt" };
+      return null;
+    }),
   };
 });
 
@@ -80,7 +86,9 @@ describe("interaction/requestProviderRuntimeHeaders", () => {
     const [id, result] = vi.mocked(backend.sendReply).mock.calls[0]!;
     expect(id).toBe(301);
     expect(result).toMatchObject({ headersApplied: false });
-    expect((result as { errorMessage?: string }).errorMessage).toContain("Start Plan");
+    expect((result as { errorMessage?: string }).errorMessage).toContain(
+      "credentials are not available",
+    );
     // No ACP request forwarded, no unsupported-request protocol error.
     expect(cx.request).not.toHaveBeenCalled();
     expect(backend.sendError).not.toHaveBeenCalled();
@@ -128,6 +136,37 @@ describe("interaction/requestProviderRuntimeHeaders", () => {
     });
     expect(cx.request).not.toHaveBeenCalled();
   });
+
+  it("serves the start-plan JWT with the same result shape (desktop parity)", async () => {
+    // Desktop source (accountProviderRequestAuthService.ts) answers start-plan
+    // with `{apiKey: zcodeJwtToken}` and no headers — the bridge mirrors it.
+    const server = makeServer();
+    const backend = makeBackend([
+      {
+        id: 304,
+        method: "interaction/requestProviderRuntimeHeaders",
+        params: {
+          requestId: "zs1:provider-runtime-headers:3",
+          sessionId: "zs1",
+          providerId: "account:bigmodel-start-plan",
+          modelSelection: {
+            providerId: "account:bigmodel-start-plan",
+            modelId: "GLM-5.3-Flash",
+          },
+          reason: "model-request",
+        },
+      },
+    ]);
+    const cx = { request: vi.fn() } as unknown as acp.AgentContext;
+
+    const handled = await handleServerRequests(server, backend, cx, "s1");
+    expect(handled).toBe(true);
+    expect(backend.sendReply).toHaveBeenCalledWith(304, {
+      headersApplied: true,
+      requestAuth: { apiKey: "start-plan-jwt" },
+    });
+    expect(cx.request).not.toHaveBeenCalled();
+  });
 });
 
 describe("answerProviderRuntimeHeaders (arrival-time responder)", () => {
@@ -155,6 +194,20 @@ describe("answerProviderRuntimeHeaders (arrival-time responder)", () => {
     expect(backend.sendReply).toHaveBeenCalledWith(88, {
       headersApplied: true,
       requestAuth: { apiKey: "test-key" },
+    });
+  });
+
+  it("answers the start-plan JWT inline (arrival-time, no turn loop needed)", () => {
+    const backend = makeBackend([]);
+    expect(
+      answerProviderRuntimeHeaders(backend, 89, "interaction/requestProviderRuntimeHeaders", {
+        modelSelection: { providerId: "account:bigmodel-start-plan", modelId: "GLM-5.3-Flash" },
+        providerId: "account:bigmodel-start-plan",
+      }),
+    ).toBe(true);
+    expect(backend.sendReply).toHaveBeenCalledWith(89, {
+      headersApplied: true,
+      requestAuth: { apiKey: "start-plan-jwt" },
     });
   });
 

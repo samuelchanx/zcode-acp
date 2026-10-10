@@ -38,9 +38,9 @@ import {
   setThoughtLevel,
 } from "./handlers/extensions.js";
 import { echoUserPromptToOthers, sendAvailableCommandsDeferred } from "./handlers/io.js";
-import { resetKnownCommandCache } from "./handlers/slash.js";
 import { loadEarlier } from "./handlers/replay.js";
 import { resendPendingInteractions } from "./handlers/server-requests.js";
+import { resetKnownCommandCache } from "./handlers/slash.js";
 import { loadPluginCommands } from "./config/plugin-commands.js";
 import { loadSkillCommands } from "./config/skill-discovery.js";
 import { filterWorkflowCommands } from "./config/workflow-gate.js";
@@ -59,8 +59,14 @@ import { AGENT_INFO, SLASH_COMMANDS, log, warn } from "./utils.js";
  * would keep advertising a stale menu (and ZWSP-neutralise freshly installed
  * skill commands) until the process happened to respawn. Deduplicates by
  * name — static commands take priority, then plugins, then skills.
+ *
+ * ALSO drops the slash handler's known-command cache: the passthrough set and
+ * the advertised menu are rebuilt from the same scan and can never disagree.
+ * Folding the reset in here (it used to be a separate call the caller had to
+ * remember) removes the silent-divergence risk for every future caller.
  */
 function buildAllCommands() {
+  resetKnownCommandCache();
   const pluginCommands = loadPluginCommands();
   const skillCommands = loadSkillCommands();
   // Localize the static commands' descriptions (names/hints stay as-is —
@@ -80,16 +86,6 @@ function buildAllCommands() {
     }
   }
   return merged;
-}
-
-/**
- * Fresh command surface for a session open: rescan the filesystem and drop
- * the slash handler's known-command cache so passthrough decisions
- * (`neutralizeSlashText`) and the advertised menu can never disagree.
- */
-function freshCommands(): ReturnType<typeof buildAllCommands> {
-  resetKnownCommandCache();
-  return buildAllCommands();
 }
 
 export async function main(): Promise<void> {
@@ -144,7 +140,7 @@ export async function main(): Promise<void> {
   }, 2000);
   backendDeathInterval.unref();
 
-  const app = buildAgentApp(server, freshCommands);
+  const app = buildAgentApp(server, buildAllCommands);
 
   // Register broadcast tracking BEFORE connect so the stdio connection is
   // captured, then wire the stdio transport. The same app is later shared
@@ -165,11 +161,14 @@ export async function main(): Promise<void> {
  * the stdio server (`main`) and the headless serve bridge (`runHeadless`) —
  * one build, two transports.
  */
-function buildAgentApp(server: ZcodeAcpServer, buildCommands: () => ReturnType<typeof buildAllCommands>) {
+function buildAgentApp(
+  server: ZcodeAcpServer,
+  buildCommands: () => ReturnType<typeof buildAllCommands>,
+) {
   // Exposed for the gate-aware menu catch-up (resendMenuAfterGateSettled in
-  // handlers/session.ts) — a cold bridge's menu snapshot predates the verdict.
-  // Built fresh so the catch-up list reflects plugins installed since boot.
-  server.allCommands = buildCommands();
+  // handlers/session.ts) — the BUILDER is stored, not a snapshot, so the
+  // catch-up list reflects plugins/skills installed since boot.
+  server.buildCommands = buildCommands;
   /** Passthrough params parser for the ZCode-specific extension methods. */
   const extParams = z.object({ sessionId: z.string() }).passthrough();
 
@@ -368,7 +367,7 @@ export async function runHeadless(): Promise<void> {
   // stdin ignored, and ADR-0001's "editor closed stdin" signal has no editor
   // to come from — idle exit below is this mode's shutdown path.
 
-  const app = buildAgentApp(server, freshCommands);
+  const app = buildAgentApp(server, buildAllCommands);
   // Track connections BEFORE the endpoint accepts any WS client so every
   // remote connection lands in the broadcast registry from its first message.
   trackConnections(app, server.clients);

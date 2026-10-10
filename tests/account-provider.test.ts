@@ -50,7 +50,9 @@ vi.mock("../src/backend/resolve.js", () => ({
 import {
   accountProviderIdFor,
   buildAccountProviderConfig,
+  codingPlanRequestAuthFor,
   configProviderIdFor,
+  isStartPlanProviderId,
 } from "../src/config/account-provider.js";
 
 /** Minimal bundled table with two coding-plan providers (one zai, one bigmodel). */
@@ -76,6 +78,20 @@ const TABLE = {
               accountType: "bigmodel",
             },
             builtinModelIds: ["GLM-5.3", "GLM-5.3-Flash"],
+          },
+        },
+        {
+          providerId: "account:bigmodel-start-plan",
+          config: {
+            access: { type: "zhipu-account", mode: "start-plan", accountType: "bigmodel" },
+            builtinModelIds: ["GLM-5.3", "GLM-5.3-Flash", "GLM-5.3-Air"],
+          },
+        },
+        {
+          providerId: "account:zai-start-plan",
+          config: {
+            access: { type: "zhipu-account", mode: "start-plan", accountType: "zai" },
+            builtinModelIds: ["GLM-5.3", "GLM-5.3-Flash", "GLM-5.3-Air"],
           },
         },
       ],
@@ -240,5 +256,136 @@ describe("buildAccountProviderConfig", () => {
       }),
     );
     expect(buildAccountProviderConfig()).toBeNull();
+  });
+});
+
+describe("start-plan support (Weekend Build)", () => {
+  it("recognises start-plan provider ids in both spellings", () => {
+    expect(isStartPlanProviderId("builtin:bigmodel-start-plan")).toBe(true);
+    expect(isStartPlanProviderId("builtin:zai-start-plan")).toBe(true);
+    expect(isStartPlanProviderId("builtin:bigmodel-coding-plan")).toBe(false);
+    expect(isStartPlanProviderId("builtin:bigmodel-team-coding-plan")).toBe(false);
+    expect(isStartPlanProviderId("account:bigmodel-start-plan")).toBe(false);
+    expect(isStartPlanProviderId("builtin:bigmodel")).toBe(false);
+  });
+
+  it("maps the start-plan id through the table and back", () => {
+    expect(accountProviderIdFor("builtin:bigmodel-start-plan")).toBe(
+      "account:bigmodel-start-plan",
+    );
+    expect(configProviderIdFor("account:bigmodel-start-plan")).toBe(
+      "builtin:bigmodel-start-plan",
+    );
+  });
+
+  it("entitles a start plan whose JWT sits in config.json even at enabled:false", () => {
+    // The desktop writes enabled:false on start-plan entries even while the
+    // plan is the user's active connection — the JWT is the connection record.
+    writeFileSync(
+      zcodeCfgPath.value,
+      JSON.stringify({
+        provider: {
+          "builtin:bigmodel-start-plan": {
+            enabled: false,
+            options: { apiKey: "start-plan-jwt" },
+          },
+          "builtin:zai-start-plan": {
+            enabled: false,
+            options: { apiKey: "" }, // connected but never provisioned — not entitled
+          },
+        },
+      }),
+    );
+    const payload = buildAccountProviderConfig();
+    expect(payload).not.toBeNull();
+    expect(payload!.providers["account:bigmodel-start-plan"]).toMatchObject({
+      access: { type: "zhipu-account", entitled: true },
+      builtinModelIds: ["GLM-5.3", "GLM-5.3-Flash", "GLM-5.3-Air"],
+    });
+    expect(payload!.providers["account:zai-start-plan"]).toMatchObject({
+      access: { entitled: false },
+    });
+  });
+
+  it("serves the start-plan JWT as requestAuth (the desktop's own answer shape)", () => {
+    writeFileSync(
+      zcodeCfgPath.value,
+      JSON.stringify({
+        provider: {
+          "builtin:bigmodel-start-plan": {
+            enabled: false,
+            options: { apiKey: "start-plan-jwt" },
+          },
+        },
+      }),
+    );
+    expect(codingPlanRequestAuthFor("account:bigmodel-start-plan")).toEqual({
+      apiKey: "start-plan-jwt",
+    });
+  });
+
+  it("derives the start-plan mode from the id when the bundled table is absent", () => {
+    // Headless Linux: no desktop bundle, no table — the id spelling carries
+    // the mode (mirrors configProviderIdFor's fallback convention).
+    const missing = path.join(root, "config", "provider", "missing.json");
+    process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = missing;
+    builtinProviderEnv.mockReturnValue({ ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: missing });
+    writeFileSync(
+      zcodeCfgPath.value,
+      JSON.stringify({
+        provider: {
+          "builtin:bigmodel-start-plan": {
+            enabled: false,
+            options: { apiKey: "start-plan-jwt" },
+          },
+        },
+      }),
+    );
+    expect(codingPlanRequestAuthFor("account:bigmodel-start-plan")).toEqual({
+      apiKey: "start-plan-jwt",
+    });
+  });
+
+  it("declines a start plan with no usable JWT and unknown account shapes", () => {
+    writeFileSync(
+      zcodeCfgPath.value,
+      JSON.stringify({
+        provider: {
+          "builtin:zai-start-plan": { enabled: false, options: { apiKey: "" } },
+        },
+      }),
+    );
+    expect(codingPlanRequestAuthFor("account:zai-start-plan")).toBeNull();
+    expect(codingPlanRequestAuthFor("account:mystery-plan")).toBeNull();
+    expect(codingPlanRequestAuthFor(undefined)).toBeNull();
+    // Team plans stay unservable (store-encrypted keys).
+    writeFileSync(
+      tablePath,
+      JSON.stringify({
+        schemaVersion: 1,
+        revision: 28,
+        config: {
+          providerConfigRules: {
+            providerRules: [
+              {
+                providerId: "account:bigmodel-team-coding-plan",
+                config: {
+                  access: { type: "zhipu-account", mode: "team-coding-plan", accountType: "bigmodel" },
+                },
+              },
+            ],
+          },
+        },
+      }),
+    );
+    writeFileSync(
+      zcodeCfgPath.value,
+      JSON.stringify({
+        provider: {
+          "builtin:bigmodel-coding-plan": { enabled: true, options: { apiKey: "k" } },
+        },
+      }),
+    );
+    expect(codingPlanRequestAuthFor("account:bigmodel-team-coding-plan")).toBeNull();
   });
 });

@@ -93,6 +93,81 @@ function loadDisabledSkillPaths(config: CliConfig | null): Set<string> {
   return disabled;
 }
 
+/** Mutable scan state shared by every scope scanner (first occurrence wins). */
+interface SkillScan {
+  /** absolute SKILL.md paths disabled in cli config.json. */
+  disabledPaths: Set<string>;
+  /** discovered entries, in scan order. */
+  results: SkillEntry[];
+  /** `$name` keys already advertised — dedup across scopes. */
+  seen: Set<string>;
+}
+
+/**
+ * Read one skill directory's SKILL.md into an entry. Null when the dir is not
+ * a skill (no SKILL.md), is disabled, or fails the frontmatter checks — the
+ * single validation path every scanner shares.
+ */
+function readSkillEntry(skillDir: string, disabledPaths: Set<string>): SkillEntry | null {
+  const skillMd = path.join(skillDir, "SKILL.md");
+  if (!existsSync(skillMd)) return null;
+  // Resolve absolute path for disabled-check.
+  if (disabledPaths.has(path.resolve(skillMd))) return null;
+  let content: string;
+  try {
+    content = readFileSync(skillMd, "utf8");
+  } catch {
+    return null;
+  }
+  const fm = parseFrontmatter(content);
+  const name = fm["name"] ?? path.basename(skillDir);
+  const description = fm["description"] ?? "";
+  if (!description) return null;
+  // Skip explicitly non-user-invocable skills.
+  if (fm["user-invocable"] === "false") return null;
+  // Prefix with $ so the editor groups skills visually (e.g. "$tdd") and
+  // handleSlashCommand can route by prefix.
+  const skillEntry: SkillEntry = {
+    name: `$${name}`,
+    description: truncateDesc(description),
+  };
+  // Only request follow-up input when the skill author explicitly declares
+  // an argument-hint — matching plugin-commands.ts behaviour. Skills without
+  // argument-hint (e.g. $tdd, $setup-matt-pocock-skills) send immediately on
+  // selection; skills with one (e.g. $handoff, $teach) wait for user input.
+  const hint = fm["argument-hint"];
+  if (hint) skillEntry.input = { hint };
+  return skillEntry;
+}
+
+/** Add a discovered entry unless its `$name` was already advertised. */
+function addSkill(scan: SkillScan, entry: SkillEntry | null): void {
+  if (!entry || scan.seen.has(entry.name)) return;
+  scan.seen.add(entry.name);
+  scan.results.push(entry);
+}
+
+/** Subdirectories of dir, in readdir order (empty when dir is missing/unreadable). */
+function listSubdirs(dir: string): string[] {
+  if (!existsSync(dir)) return [];
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  for (const entry of entries) {
+    const sub = path.join(dir, entry);
+    try {
+      if (statSync(sub).isDirectory()) out.push(sub);
+    } catch {
+      // unreadable entry — skip
+    }
+  }
+  return out;
+}
+
 /**
  * Scan a plugin's `skills/` directory. Plugins ship two layouts:
  *   flat      — `<plugin>/<ver>/skills/<name>/SKILL.md`
@@ -100,89 +175,24 @@ function loadDisabledSkillPaths(config: CliConfig | null): Set<string> {
  *              (e.g. mattpocock-skills `skills/engineering/implement/`)
  * A directory that carries its own SKILL.md is itself a skill and is never
  * descended into — helper dirs inside a skill (e.g. `implement/agents/`)
- * must not be advertised.
+ * must not be advertised. Flat entries are collected first so they win name
+ * clashes within the plugin.
  */
-function scanPluginSkillsDir(
-  skillsDir: string,
-  disabledPaths: Set<string>,
-  results: SkillEntry[],
-  seen: Set<string>,
-): void {
-  // Flat layout first (priority on name clash within the plugin).
-  scanSkillDir(skillsDir, disabledPaths, results, seen);
-  if (!existsSync(skillsDir)) return;
-  let entries: string[];
-  try {
-    entries = readdirSync(skillsDir);
-  } catch {
-    return;
+function scanPluginSkillsDir(skillsDir: string, scan: SkillScan): void {
+  const subdirs = listSubdirs(skillsDir);
+  for (const dir of subdirs) {
+    if (existsSync(path.join(dir, "SKILL.md")))
+      addSkill(scan, readSkillEntry(dir, scan.disabledPaths));
   }
-  for (const entry of entries) {
-    const catDir = path.join(skillsDir, entry);
-    try {
-      if (!statSync(catDir).isDirectory()) continue;
-    } catch {
-      continue;
-    }
-    // Category dirs group skills; a real skill dir is handled above.
-    if (existsSync(path.join(catDir, "SKILL.md"))) continue;
-    scanSkillDir(catDir, disabledPaths, results, seen);
+  for (const dir of subdirs) {
+    if (!existsSync(path.join(dir, "SKILL.md"))) scanSkillDir(dir, scan);
   }
 }
 
 /** Scan a directory for skill subdirectories containing SKILL.md. */
-function scanSkillDir(
-  dir: string,
-  disabledPaths: Set<string>,
-  results: SkillEntry[],
-  seen: Set<string>,
-): void {
-  if (!existsSync(dir)) return;
-  let entries: string[];
-  try {
-    entries = readdirSync(dir);
-  } catch {
-    return;
-  }
-  for (const entry of entries) {
-    const skillDir = path.join(dir, entry);
-    try {
-      if (!statSync(skillDir).isDirectory()) continue;
-    } catch {
-      continue;
-    }
-    const skillMd = path.join(skillDir, "SKILL.md");
-    if (!existsSync(skillMd)) continue;
-
-    // Resolve absolute path for disabled-check.
-    const absPath = path.resolve(skillMd);
-    if (disabledPaths.has(absPath)) continue;
-
-    const content = readFileSync(skillMd, "utf8");
-    const fm = parseFrontmatter(content);
-    const name = fm["name"] ?? entry;
-    const description = fm["description"] ?? "";
-    if (!description) continue;
-
-    // Skip explicitly non-user-invocable skills.
-    if (fm["user-invocable"] === "false") continue;
-
-    // Prefix with $ so the editor groups skills visually (e.g. "$tdd") and
-    // handleSlashCommand can route by prefix.
-    const cmdName = `$${name}`;
-    if (seen.has(cmdName)) continue;
-    seen.add(cmdName);
-    const skillEntry: SkillEntry = {
-      name: cmdName,
-      description: truncateDesc(description),
-    };
-    // Only request follow-up input when the skill author explicitly declares
-    // an argument-hint — matching plugin-commands.ts behaviour. Skills without
-    // argument-hint (e.g. $tdd, $setup-matt-pocock-skills) send immediately on
-    // selection; skills with one (e.g. $handoff, $teach) wait for user input.
-    const hint = fm["argument-hint"];
-    if (hint) skillEntry.input = { hint };
-    results.push(skillEntry);
+function scanSkillDir(dir: string, scan: SkillScan): void {
+  for (const sub of listSubdirs(dir)) {
+    addSkill(scan, readSkillEntry(sub, scan.disabledPaths));
   }
 }
 
@@ -193,9 +203,6 @@ function scanSkillDir(
  * failures are logged and swallowed (returns whatever was found).
  */
 export function loadSkillCommands(): SkillEntry[] {
-  const results: SkillEntry[] = [];
-  const seen = new Set<string>();
-
   // Load config for disabled-skills list + enabled-plugins list.
   let config: CliConfig | null = null;
   try {
@@ -207,13 +214,17 @@ export function loadSkillCommands(): SkillEntry[] {
     log(`skill-discovery: config read failed (${e instanceof Error ? e.message : String(e)})`);
   }
 
-  const disabledPaths = loadDisabledSkillPaths(config);
+  const scan: SkillScan = {
+    disabledPaths: loadDisabledSkillPaths(config),
+    results: [],
+    seen: new Set<string>(),
+  };
 
   // 1. User skills under the ZCode data root.
-  scanSkillDir(path.join(zcodeHomeDir(), "skills"), disabledPaths, results, seen);
+  scanSkillDir(path.join(zcodeHomeDir(), "skills"), scan);
 
   // 2. ~/.agents/skills/
-  scanSkillDir(path.join(homedir(), ".agents", "skills"), disabledPaths, results, seen);
+  scanSkillDir(path.join(homedir(), ".agents", "skills"), scan);
 
   // 3. Enabled plugin skills.
   const enabledPlugins = config?.plugins?.enabledPlugins ?? {};
@@ -241,16 +252,16 @@ export function loadSkillCommands(): SkillEntry[] {
     }
     if (!latestVersion) continue;
 
-    scanPluginSkillsDir(path.join(pluginDir, latestVersion, "skills"), disabledPaths, results, seen);
+    scanPluginSkillsDir(path.join(pluginDir, latestVersion, "skills"), scan);
   }
 
   // 4. Project-level .zcode/skills/ (if exists) — ZCode-native project scope,
   //    scanned before .agents to mirror ZCode's own precedence.
-  scanSkillDir(path.join(process.cwd(), ".zcode", "skills"), disabledPaths, results, seen);
+  scanSkillDir(path.join(process.cwd(), ".zcode", "skills"), scan);
 
   // 5. Project-level .agents/skills/ (if exists).
-  scanSkillDir(path.join(process.cwd(), ".agents", "skills"), disabledPaths, results, seen);
+  scanSkillDir(path.join(process.cwd(), ".agents", "skills"), scan);
 
-  log(`skill-discovery: loaded ${results.length} skill(s)`);
-  return results;
+  log(`skill-discovery: loaded ${scan.results.length} skill(s)`);
+  return scan.results;
 }

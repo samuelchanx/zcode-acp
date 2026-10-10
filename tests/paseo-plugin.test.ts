@@ -130,6 +130,8 @@ function registeredProviders(): ProviderRegistration[] {
     registerProvider: (provider: ProviderRegistration) => {
       captured.push(provider);
     },
+    handle: () => {},
+    registerUsageSource: () => {},
   } as unknown as PluginServerContext;
   const cleanup = contribute(fakeServer);
   expect(typeof cleanup).toBe("function");
