@@ -42,6 +42,7 @@ import { runAcpProvider } from "@getpaseo/plugin/server/acp";
 
 import { handleQuota } from "./server/quota";
 import { createUsageSource } from "./server/usage";
+import { createOllamaUsageSource } from "./server/usage-ollama";
 import { quotaGet } from "./shared/quota";
 
 export default function contribute(server: PluginServerContext) {
@@ -81,8 +82,11 @@ export default function contribute(server: PluginServerContext) {
   );
   server.handle(quotaGet, handleQuota);
   // Usage sources arrived in Paseo 0.11; older daemons skip the native card.
+  // Two sources: GLM Coding Plan (the zcode provider's harness quota) and
+  // Ollama Cloud (the shared device identity behind the router's cloud models).
   if (typeof server.registerUsageSource === "function") {
     server.registerUsageSource(createUsageSource());
+    server.registerUsageSource(createOllamaUsageSource());
   }
   return () => {};
 }

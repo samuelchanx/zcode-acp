@@ -101,7 +101,10 @@ Application → Cookies → opencode.ai):
   OPENCODE_GO_AUTH_COOKIE     the "auth" cookie value (starts with Fe26.2**)
   OPENCODE_GO_SESSION_TOKEN   the "__Host-console_session" cookie value (st_…)
 Ollama Cloud:
-  OLLAMA_API_KEY              an Ollama Cloud API key (cloud.ollama.ai → API keys)
+  (signed-in local Ollama)  no key needed — a signed-in desktop app/serve
+                            answers the balance itself (device auth).
+  OLLAMA_API_KEY            an Ollama Cloud API key (ollama.com → API keys),
+                            the fallback when no local Ollama is signed in.
 CLIProxyAPI (HTTPS mandatory — the management key relays account credentials):
   CLIPROXY_URL                management base URL, e.g. https://cp.example.com:8317
   CLIPROXY_MANAGEMENT_KEY     the server's remote-management secret-key

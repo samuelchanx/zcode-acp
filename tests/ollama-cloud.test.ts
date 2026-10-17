@@ -1,11 +1,13 @@
 /**
  * Tests for the Ollama Cloud usage feature: response validation, the HTTP
- * client (Bearer header), query orchestration (env-driven credentials, cache
- * TTL, error degradation), credential merging (env + config file), and
- * section rendering.
+ * client (Bearer header), query orchestration (local device-auth → API-key
+ * fallback, cache TTL, error degradation), credential merging (env + config
+ * file), and section rendering.
  *
- * Orchestration tests mock the client module so no real network happens; the
- * fs mock intercepts the config path fully (hermetic regardless of host).
+ * Orchestration tests mock the web + local client modules so no real network
+ * happens; the local module's PARSER stays real (the fixture bodies are the
+ * shapes the live endpoints return). The fs mock intercepts the config path
+ * fully (hermetic regardless of host).
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -20,6 +22,24 @@ vi.mock("../src/quota/ollama-cloud/client.js", () => ({
   ME_URL: "https://ollama.com/api/me",
 }));
 
+// Mock the local device-auth FETCHES + the plan lookup (which closes over the
+// module's own fetchLocalMe — a spread-override would NOT be seen inside it),
+// but keep the parser real: the fixture bodies are the live shapes (verified
+// 2026-10-17), so the mapping (remaining_percent 0..100 → usage fraction,
+// resets_at → epoch ms) stays under test. The real fetch/plan functions are
+// exercised with injected fetch impls in the pure-functions describe.
+vi.mock("../src/quota/ollama-cloud/local.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/quota/ollama-cloud/local.js")>(
+    "../src/quota/ollama-cloud/local.js",
+  );
+  return {
+    ...actual,
+    fetchLocalBalance: vi.fn(),
+    fetchLocalMe: vi.fn(),
+    lookupLocalPlan: vi.fn(),
+  };
+});
+
 // Control the config-file side of credential resolution: loadApiKey reads
 // loadUserConfig() live, so a per-test mock value stands in for
 // ~/.config/zcode-acp/config.json's quota.ollamaApiKey.
@@ -33,6 +53,13 @@ vi.mock("../src/config/user-config.js", async () => {
 
 import { clearCache, setClock } from "../src/quota/ollama-cloud/cache.js";
 import { fetchOcMe, fetchOcUsage } from "../src/quota/ollama-cloud/client.js";
+import {
+  fetchLocalBalance,
+  fetchLocalMe,
+  localOrigin,
+  lookupLocalPlan,
+  parseLocalBalance,
+} from "../src/quota/ollama-cloud/local.js";
 import { formatOcSection } from "../src/quota/ollama-cloud/format.js";
 import {
   nextMonthlyAnniversary,
@@ -49,6 +76,9 @@ import type { OcQueryResult } from "../src/quota/ollama-cloud/types.js";
 
 const mockedFetch = vi.mocked(fetchOcUsage);
 const mockedMe = vi.mocked(fetchOcMe);
+const mockedLocalBalance = vi.mocked(fetchLocalBalance);
+const mockedLocalMe = vi.mocked(fetchLocalMe);
+const mockedLocalPlan = vi.mocked(lookupLocalPlan);
 
 /** Set the config-file key (null = no quota section in the file). */
 function setFileKey(key: string | null): void {
@@ -103,6 +133,21 @@ function dayBucket(fromMs: number, usageUsd: number, requestCount = 0): OcUsageB
 }
 
 const DAY = 86_400_000;
+
+/** Live GET /api/balance body (local device-auth, verified 2026-10-17). */
+function balanceBody(
+  windows: Partial<Record<"session" | "weekly" | "monthly", [number, string]>>,
+  purchasedUsd?: number,
+): string {
+  const included: Record<string, { remaining_percent: number; resets_at: string }> = {};
+  for (const [key, [remaining, resets]] of Object.entries(windows)) {
+    included[key] = { remaining_percent: remaining, resets_at: resets };
+  }
+  return JSON.stringify({
+    included,
+    ...(purchasedUsd !== undefined && { purchased: { balance_usd: purchasedUsd } }),
+  });
+}
 
 // --- formatOcSection -------------------------------------------------------
 
@@ -222,12 +267,16 @@ describe("queryOcUsage orchestration", () => {
     setClock(() => 5000);
     mockedFetch.mockReset();
     mockedMe.mockReset();
+    mockedLocalBalance.mockReset();
+    mockedLocalMe.mockReset();
     setFileKey(null);
+    delete process.env.OLLAMA_API_KEY;
   });
   afterEach(() => {
     clearCache();
     setClock(undefined);
     delete process.env.OLLAMA_API_KEY;
+    delete process.env.OLLAMA_HOST;
   });
 
   it("returns not_configured when no key resolves (env + file absent)", async () => {
@@ -643,6 +692,10 @@ describe("credential merging", () => {
     clearCache();
     setClock(() => 5000);
     mockedFetch.mockReset();
+    // Local source silent and absent: these tests exercise the KEY path.
+    mockedLocalBalance.mockReset();
+    mockedLocalBalance.mockRejectedValue(new Error("connection refused"));
+    mockedLocalMe.mockReset();
     setFileKey(null);
     mockedFetch.mockResolvedValue({ status: 200, text: usageBody(0.1, 0.2) });
   });
@@ -676,5 +729,254 @@ describe("credential merging", () => {
     process.env.OLLAMA_API_KEY = "   ";
     expect((await queryOcUsage()).kind).toBe("not_configured");
     expect(mockedFetch).not.toHaveBeenCalled();
+  });
+});
+
+// --- local device-auth source (stage 1) -------------------------------------
+
+describe("queryOcUsage local device-auth source", () => {
+  const SESSION_RESET = Date.parse("2026-10-17T08:00:00Z");
+  const WEEKLY_RESET = Date.parse("2026-10-19T00:00:00Z");
+
+  beforeEach(() => {
+    clearCache();
+    setClock(() => 5000);
+    mockedFetch.mockReset();
+    mockedMe.mockReset();
+    mockedLocalBalance.mockReset();
+    mockedLocalMe.mockReset();
+    mockedLocalPlan.mockReset();
+    setFileKey(null);
+    delete process.env.OLLAMA_API_KEY;
+    delete process.env.OLLAMA_HOST;
+  });
+  afterEach(() => {
+    clearCache();
+    setClock(undefined);
+    delete process.env.OLLAMA_API_KEY;
+    delete process.env.OLLAMA_HOST;
+  });
+
+  it("local balance wins with exact resets, plan, and purchased credits — no key needed", async () => {
+    mockedLocalBalance.mockResolvedValue({
+      status: 200,
+      text: balanceBody(
+        {
+          session: [68.25, "2026-10-17T08:00:00Z"],
+          weekly: [31.02, "2026-10-19T00:00:00Z"],
+        },
+        0,
+      ),
+    });
+    mockedLocalPlan.mockResolvedValue("pro");
+
+    const result = await queryOcUsage();
+    expect(result.kind).toBe("success");
+    if (result.kind !== "success") return;
+    expect(result.session).toBe((100 - 68.25) / 100);
+    expect(result.weekly).toBe((100 - 31.02) / 100);
+    // Resets come straight from the endpoint — nothing derived.
+    expect(result.sessionResetAt).toBe(SESSION_RESET);
+    expect(result.weeklyResetAt).toBe(WEEKLY_RESET);
+    expect(result.purchasedUsd).toBe(0);
+    expect(result.plan).toBe("pro");
+    // The web key path was never touched.
+    expect(mockedFetch).not.toHaveBeenCalled();
+    expect(mockedMe).not.toHaveBeenCalled();
+  });
+
+  it("local wins even when a key is configured (device = the serving identity)", async () => {
+    process.env.OLLAMA_API_KEY = "sk-test";
+    mockedLocalBalance.mockResolvedValue({
+      status: 200,
+      text: balanceBody({ weekly: [80, "2026-10-19T00:00:00Z"] }),
+    });
+    const result = await queryOcUsage();
+    expect(result.kind).toBe("success");
+    expect(mockedFetch).not.toHaveBeenCalled();
+  });
+
+  it("connection-refused on localhost falls through to the API-key path", async () => {
+    mockedLocalBalance.mockRejectedValue(new Error("connection refused"));
+    process.env.OLLAMA_API_KEY = "sk-test";
+    mockedFetch.mockResolvedValue({ status: 200, text: usageBody(0.1, 0.2) });
+    const result = await queryOcUsage();
+    expect(result).toMatchObject({ kind: "success", session: 0.1, weekly: 0.2 });
+    expect(mockedFetch).toHaveBeenCalledWith("sk-test");
+  });
+
+  it("non-200 local answer (signed-out or old server) falls through", async () => {
+    mockedLocalBalance.mockResolvedValue({ status: 404, text: "404 page not found" });
+    process.env.OLLAMA_API_KEY = "sk-test";
+    mockedFetch.mockResolvedValue({ status: 200, text: usageBody(null, 0.5) });
+    const result = await queryOcUsage();
+    expect(result).toMatchObject({ kind: "success", weekly: 0.5 });
+  });
+
+  it("unrecognised local shape falls through", async () => {
+    mockedLocalBalance.mockResolvedValue({ status: 200, text: JSON.stringify({ hello: "world" }) });
+    mockedLocalPlan.mockResolvedValue("pro");
+    process.env.OLLAMA_API_KEY = "sk-test";
+    mockedFetch.mockResolvedValue({ status: 200, text: usageBody(0.2, 0.3) });
+    const result = await queryOcUsage();
+    expect(result).toMatchObject({ kind: "success", session: 0.2, weekly: 0.3 });
+    // Plan lookup is a stage-1 concern only — never runs on the key path.
+    expect(mockedLocalPlan).not.toHaveBeenCalled();
+  });
+
+  it("remaining_percent outside [0, 100] falls through (shape guard)", async () => {
+    mockedLocalBalance.mockResolvedValue({
+      status: 200,
+      text: JSON.stringify({
+        included: { session: { remaining_percent: 250, resets_at: "2026-10-17T08:00:00Z" } },
+      }),
+    });
+    process.env.OLLAMA_API_KEY = "sk-test";
+    mockedFetch.mockResolvedValue({ status: 200, text: usageBody(0.1, 0.1) });
+    const result = await queryOcUsage();
+    expect(result).toMatchObject({ kind: "success" });
+  });
+
+  it("plan lookup failure still serves the balance windows (best-effort)", async () => {
+    mockedLocalBalance.mockResolvedValue({
+      status: 200,
+      text: balanceBody({ weekly: [20.5, "2026-10-19T00:00:00Z"] }),
+    });
+    // The real lookupLocalPlan catches internally and yields undefined.
+    mockedLocalPlan.mockResolvedValue(undefined);
+    const result = await queryOcUsage();
+    expect(result).toMatchObject({
+      kind: "success",
+      weekly: (100 - 20.5) / 100,
+      weeklyResetAt: WEEKLY_RESET,
+    });
+    expect(result.kind === "success" && result.plan).toBeUndefined();
+  });
+
+  it("no local server and no key → still not_configured", async () => {
+    mockedLocalBalance.mockRejectedValue(new Error("connection refused"));
+    expect((await queryOcUsage()).kind).toBe("not_configured");
+    expect(mockedFetch).not.toHaveBeenCalled();
+  });
+
+  it("serves a cached local result within the TTL window", async () => {
+    mockedLocalBalance.mockResolvedValue({
+      status: 200,
+      text: balanceBody({ session: [50, "2026-10-17T08:00:00Z"] }),
+    });
+    await queryOcUsage();
+    setClock(() => 5000 + 9_000);
+    await queryOcUsage();
+    expect(mockedLocalBalance).toHaveBeenCalledTimes(1);
+  });
+});
+
+// --- local module pure functions --------------------------------------------
+
+/** Minimal fake fetch: canned status/body, capturing (url, init). */
+function fakeFetch(
+  status: number,
+  body: string,
+  sink?: { url: string; init: RequestInit },
+): typeof globalThis.fetch {
+  return (async (url: unknown, init?: RequestInit) => {
+    if (sink) {
+      sink.url = String(url);
+      sink.init = init ?? {};
+    }
+    return { status, text: async () => body } as Response;
+  }) as unknown as typeof globalThis.fetch;
+}
+
+describe("local.ts pure functions", () => {
+  it("localOrigin honours OLLAMA_HOST in host:port and URL forms", async () => {
+    const { localOrigin } = await vi.importActual<
+      typeof import("../src/quota/ollama-cloud/local.js")
+    >("../src/quota/ollama-cloud/local.js");
+    expect(localOrigin({} as NodeJS.ProcessEnv)).toBe("http://127.0.0.1:11434");
+    expect(localOrigin({ OLLAMA_HOST: "localhost:12345" } as NodeJS.ProcessEnv)).toBe(
+      "http://localhost:12345",
+    );
+    expect(localOrigin({ OLLAMA_HOST: "http://192.168.1.5:11434/" } as NodeJS.ProcessEnv)).toBe(
+      "http://192.168.1.5:11434",
+    );
+  });
+
+  it("fetchLocalBalance GETs {origin}/api/balance (device auth, no key headers)", async () => {
+    const { fetchLocalBalance } = await vi.importActual<
+      typeof import("../src/quota/ollama-cloud/local.js")
+    >("../src/quota/ollama-cloud/local.js");
+    const sink: { url: string; init: RequestInit } = { url: "", init: {} };
+    const fetchFn = fakeFetch(200, "{}", sink);
+    const resp = await fetchLocalBalance(fetchFn, {} as NodeJS.ProcessEnv);
+    expect(resp.status).toBe(200);
+    expect(sink.url).toBe("http://127.0.0.1:11434/api/balance");
+    expect(sink.init.method).toBeUndefined(); // GET
+    expect((sink.init.headers as Record<string, string>).Authorization).toBeUndefined();
+  });
+
+  it("lookupLocalPlan parses plan (and legacy Plan) and degrades silently", async () => {
+    const { lookupLocalPlan } = await vi.importActual<
+      typeof import("../src/quota/ollama-cloud/local.js")
+    >("../src/quota/ollama-cloud/local.js");
+    const sink: { url: string; init: RequestInit } = { url: "", init: {} };
+    const caps = await lookupLocalPlan(fakeFetch(200, `{"plan":"pro"}`, sink), {} as NodeJS.ProcessEnv);
+    expect(caps).toBe("pro");
+    expect(sink.url).toBe("http://127.0.0.1:11434/api/me");
+    expect(sink.init.method).toBe("POST");
+    expect(await lookupLocalPlan(fakeFetch(200, `{"Plan":"pro"}`), {} as NodeJS.ProcessEnv)).toBe(
+      "pro",
+    );
+    expect(await lookupLocalPlan(fakeFetch(500, `{}`), {} as NodeJS.ProcessEnv)).toBeUndefined();
+    expect(
+      await lookupLocalPlan(
+        (async () => {
+          throw new Error("connection refused");
+        }) as unknown as typeof globalThis.fetch,
+        {} as NodeJS.ProcessEnv,
+      ),
+    ).toBeUndefined();
+    expect(await lookupLocalPlan(fakeFetch(200, "not json"), {} as NodeJS.ProcessEnv)).toBeUndefined();
+  });
+
+  it("parseLocalBalance maps remaining→usage, keeps monthly, drops malformed windows", async () => {
+    const { parseLocalBalance } = await vi.importActual<
+      typeof import("../src/quota/ollama-cloud/local.js")
+    >("../src/quota/ollama-cloud/local.js");
+    const now = 9000;
+    const ok = parseLocalBalance(
+      balanceBody({
+        session: [100, "2026-10-17T08:00:00Z"],
+        weekly: [0, "2026-10-19T00:00:00Z"],
+        monthly: [25, "2026-11-01T00:00:00Z"],
+      }),
+      now,
+    );
+    expect(ok).toMatchObject({
+      kind: "success",
+      session: 0,
+      weekly: 1,
+      monthly: 0.75,
+      fetchedAt: now,
+    });
+    expect(ok).not.toHaveProperty("purchasedUsd");
+
+    const withCredit = parseLocalBalance(
+      balanceBody({ session: [12.5, "2026-10-17T08:00:00Z"] }, 4.2),
+      now,
+    );
+    expect(withCredit).toMatchObject({ session: 0.875, purchasedUsd: 4.2 });
+
+    // Every window malformed / empty included → unrecognised → null.
+    expect(parseLocalBalance(JSON.stringify({ included: {} }), now)).toBeNull();
+    expect(
+      parseLocalBalance(
+        JSON.stringify({
+          included: { session: { remaining_percent: "68" /* string, not number */ } },
+        }),
+        now,
+      ),
+    ).toBeNull();
+    expect(parseLocalBalance("<html>login</html>", now)).toBeNull();
   });
 });

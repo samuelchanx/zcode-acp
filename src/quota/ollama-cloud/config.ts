@@ -1,5 +1,6 @@
 /**
- * Ollama Cloud credential discovery.
+ * Ollama Cloud API-key credential discovery (the FALLBACK source — a signed-in
+ * local Ollama's device auth is the preferred one, see ./local.ts).
  *
  * The API key comes from two sources, with the **config file taking
  * precedence** over the environment variable (the user-config convention —
@@ -12,8 +13,8 @@
  * Unlike Opencode Go (which reuses `~/.pi/agent/` for historical reasons),
  * the Ollama key is a plain static API key and belongs in our own config.
  *
- * A missing/blank key yields `not_configured` (the section is silently
- * skipped in `all` mode).
+ * With no key anywhere (and no local device identity answering), the query
+ * yields `not_configured` (the section is silently skipped in `all` mode).
  */
 
 import process from "node:process";

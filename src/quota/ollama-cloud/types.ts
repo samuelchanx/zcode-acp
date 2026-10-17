@@ -70,7 +70,8 @@ export type OcQueryResult =
       /** Start of the current billing period (epoch ms) — the bucket-sum
        *  anchor (last reset that already happened). */
       periodStartAt?: number;
-      /** Plan id from POST /api/me ("pro" / "max" / "team" / …). */
+      /** Plan id from POST /api/me ("pro" / "max" / "team" / …) — the API-key
+       *  path's monthly branch, or the local device-auth path. */
       plan?: string;
       /** The plan's monthly usage credit (USD) — the denominator of the
        *  derived `monthly` fraction; present only for plans in the pricing
@@ -84,6 +85,9 @@ export type OcQueryResult =
       outputTokens?: number;
       /** Epoch ms of the fetch (kept for symmetry with the other providers). */
       fetchedAt: number;
+      /** Purchased credit balance in USD, when the source exposes one (the
+       *  local /api/balance carries `purchased.balance_usd`). */
+      purchasedUsd?: number;
     }
   | { kind: "not_configured" }
   | { kind: "auth_error" }

@@ -69,6 +69,10 @@ const ocResultSchema = z.discriminatedUnion("kind", [
     sessionResetAt: z.number().optional(),
     weeklyResetAt: z.number().optional(),
     monthlyResetAt: z.number().optional(),
+    /** Plan tier (e.g. "pro") — carried by the local device-auth source. */
+    plan: z.string().optional(),
+    /** Purchased credit balance in USD, when the source exposes one. */
+    purchasedUsd: z.number().optional(),
     fetchedAt: z.number(),
   }),
   z.object({ kind: z.literal("not_configured") }),

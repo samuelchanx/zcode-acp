@@ -2,18 +2,28 @@
  * Ollama Cloud usage orchestration — the entry point used by the
  * `zcode-acp quota` CLI.
  *
- * Flow: credential (env + config file) → cache check → fetch → status/auth
- * check → parse → cache write. Any thrown error degrades to `unavailable`
- * rather than propagating, so the CLI always produces output.
+ * Credentials resolve in TWO stages:
+ *   1. **Local device-auth** (`./local.ts`): a signed-in local Ollama answers
+ *      `GET /api/balance` with the account's own windows — no API key, exact
+ *      reset timestamps, and the plan tier. Preferred because it reflects the
+ *      identity actually serving this machine's cloud traffic.
+ *   2. **API key** (`./config.ts`: config file → `OLLAMA_API_KEY`): the
+ *      documented `https://ollama.com/api/usage` path. Reset moments for the
+ *      session/weekly windows are DERIVED from window anchoring; the monthly
+ *      window's reset comes from `POST /api/me`.
  *
- * A missing API key yields `not_configured`, which the combined view silently
- * skips — so users who only care about GLM see no noise.
+ * Stage 1 falling through (no local server, signed out, foreign shape, 404 on
+ * an older Ollama) → stage 2 runs; both absent → `not_configured`, which the
+ * combined view silently skips — users who only care about GLM see no noise.
+ * Any thrown error degrades to `unavailable` rather than propagating, so the
+ * CLI always produces output.
  */
 
 import { log } from "../../utils.js";
 import { getCached, setCached } from "./cache.js";
 import { loadApiKey } from "./config.js";
 import { fetchOcMe, fetchOcUsage } from "./client.js";
+import { fetchLocalBalance, lookupLocalPlan, parseLocalBalance } from "./local.js";
 import type { OcQueryResult } from "./types.js";
 
 /** Session window length: a rolling 5h bucket anchored at the Unix epoch. */
@@ -39,7 +49,8 @@ export function nextWeeklyReset(t: number): number {
 }
 
 /**
- * Best-effort monthly reset lookup via POST /api/me. Two shapes exist:
+ * Best-effort POST /api/me on the API-key path: the billing-period reset for
+ * the monthly window + the plan tier. Two period shapes exist:
  * - `SubscriptionPeriodEnd` (Go `sql.NullTime` `{Time, Valid}`) — the billing
  *   period end, when the account carries one;
  * - `CreatedAt` — the subscription start. New credit plans (live-verified
@@ -275,9 +286,34 @@ function validCount(v: unknown): v is number {
 }
 
 /**
+ * Stage 1: local device-auth. `null` = fall through to the API-key path —
+ * the local server is absent, signed out, too old (no /api/balance route), or
+ * its shape is unrecognised. A local result always carries exact reset
+ * timestamps (the endpoint reports them; nothing is derived here).
+ */
+async function queryViaLocal(
+  fetchImpl: typeof globalThis.fetch = globalThis.fetch,
+): Promise<OcQueryResult | null> {
+  try {
+    const resp = await fetchLocalBalance(fetchImpl);
+    if (resp.status !== 200) return null;
+    const parsed = parseLocalBalance(resp.text, Date.now());
+    if (parsed === null || parsed.kind !== "success") return null;
+    const plan = await lookupLocalPlan(fetchImpl);
+    if (plan !== undefined) parsed.plan = plan;
+    return parsed;
+  } catch (e) {
+    log(
+      `ollama-cloud: local device-auth unavailable (${e instanceof Error ? e.message : String(e)})`,
+    );
+    return null;
+  }
+}
+
+/**
  * Query Ollama Cloud usage and return a normalised {@link OcQueryResult}.
  *
- * - No key → `not_configured`.
+ * - No local device identity and no key → `not_configured`.
  * - Serves a cached result when fresh (< 10s).
  * - HTTP 401/403 → `auth_error` (bad or revoked key).
  * - Network/timeout/parse failure → `unavailable`.
@@ -294,6 +330,13 @@ export async function queryOcUsage(): Promise<OcQueryResult> {
   if (cached) {
     log("ollama-cloud: serving cached result");
     return cached;
+  }
+
+  const local = await queryViaLocal();
+  if (local) {
+    setCached(local);
+    log("ollama-cloud: serving local device-auth result");
+    return local;
   }
 
   const apiKey = loadApiKey();
@@ -375,8 +418,9 @@ export async function queryOcUsage(): Promise<OcQueryResult> {
             fetchedAt,
           };
           if (monthly !== undefined) {
-            const { monthlyResetAt } = await lookupAccountInfo(apiKey);
+            const { monthlyResetAt, plan } = await lookupAccountInfo(apiKey);
             if (monthlyResetAt !== undefined) result.monthlyResetAt = monthlyResetAt;
+            if (plan !== undefined) result.plan = plan;
           }
         } else {
           log("ollama-cloud: response shape not recognised (endpoint may have changed)");
@@ -396,6 +440,15 @@ export async function queryOcUsage(): Promise<OcQueryResult> {
 // Re-exports for consumers (CLI + tests).
 export { clearCache, clearCache as clearOcCache } from "./cache.js";
 export { fetchOcMe, fetchOcUsage, ME_URL, USAGE_RANGE, USAGE_URL } from "./client.js";
+export {
+  fetchLocalBalance,
+  fetchLocalMe,
+  localOrigin,
+  parseLocalBalance,
+  lookupLocalPlan,
+  BALANCE_PATH,
+  ME_PATH,
+} from "./local.js";
 export { formatOcSection } from "./format.js";
 export { loadApiKey, ENV_API_KEY } from "./config.js";
 export type { OcQueryResult, OcUsageResponse } from "./types.js";

@@ -52,7 +52,7 @@ export function formatOcSection(result: OcQueryResult, color = false): RenderedS
   if (result.kind !== "success") {
     const msg =
       result.kind === "not_configured"
-        ? "not configured (set OLLAMA_API_KEY)"
+        ? "not configured (set OLLAMA_API_KEY, or sign in to a local Ollama)"
         : result.kind === "auth_error"
           ? "auth failed — check your Ollama API key"
           : "unavailable";
