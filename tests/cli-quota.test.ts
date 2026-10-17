@@ -1,16 +1,17 @@
 /**
  * Tests for the `zcode-acp quota` standalone CLI: argv parsing and interval
- * clamping. The watch loop itself is an I/O loop (sleep + redraw) and is left
- * to manual verification; only the pure helpers are unit-tested.
+ * clamping, plus the `--json` machine-output contract. The watch loop itself
+ * is an I/O loop (sleep + redraw) and is left to manual verification; only
+ * the pure helpers and the one-shot JSON path are tested.
  *
  * The bin module guards its top-level `main()` behind an `invokedDirectly`
  * check (entry path ends with `bin/quota.js`), so importing it here does NOT
  * fire a real query.
  */
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { parseArgs, resolveIntervalMs } from "../src/bin/quota.js";
+import { main, parseArgs, resolveIntervalMs } from "../src/bin/quota.js";
 
 describe("resolveIntervalMs", () => {
   it("defaults to 30s when no interval given", () => {
@@ -62,6 +63,14 @@ describe("parseArgs", () => {
   it("-d / --detail enables MCP detail sub-lines", () => {
     expect(parseArgs(["-d"]).detail).toBe(true);
     expect(parseArgs(["--detail"]).detail).toBe(true);
+  });
+
+  it("-j / --json enables machine output (the paseo-plugin quota RPC depends on it)", () => {
+    expect(parseArgs(["--json"]).json).toBe(true);
+    expect(parseArgs(["-j"]).json).toBe(true);
+    expect(parseArgs(["glm", "--json"]).json).toBe(true);
+    expect(parseArgs(["glm", "--json"]).provider).toBe("glm");
+    expect(parseArgs([]).json).toBe(false);
   });
 
   it("-i <n> sets the interval (space form)", () => {
@@ -152,3 +161,32 @@ describe("parseArgs — plain flag", () => {
 // The fork's `--json` flag (aa81708) died in the merge — upstream's quota bin
 // (glm/go/oc/cp cards) ships no json option; "json implies one-shot" survives
 // upstream-side.
+//
+// Contract test for the paseo-plugin quota RPC (paseo-plugin/server/quota.ts
+// spawns `zcode-acp quota --json` and JSON.parses stdout): the flag must make
+// main() emit exactly one parseable JSON object with the per-provider keys.
+// This is the test whose absence let the merge-072 drop ship silently.
+
+describe("quota --json contract (paseo-plugin RPC)", () => {
+  const originalWrite = process.stdout.write.bind(process.stdout);
+  let written: string;
+
+  afterEach(() => {
+    process.stdout.write = originalWrite;
+    vi.restoreAllMocks();
+  });
+
+  it("emits one JSON object with glm/go/oc keys (exit-code 0 even on provider failure)", async () => {
+    written = "";
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      written += String(chunk);
+      return true;
+    });
+    await main(["--json"]);
+    const parsed = JSON.parse(written);
+    expect(parsed.glm).toBeDefined();
+    expect(parsed.go).toBeDefined();
+    expect(parsed.oc).toBeDefined();
+    expect(typeof parsed.glm.kind).toBe("string");
+  });
+});

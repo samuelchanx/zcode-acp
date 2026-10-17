@@ -996,6 +996,78 @@ permitted` (#127); the slave allow is extension-gated (`require-all` +
   workflow. Public doc: `docs/RELEASING.md`; setup + troubleshooting runbook:
   `.zcode/docs/releasing-runbook.md` (gitignored).
 
+## Fork-only features — upstream-merge survival checklist
+
+This repo is a LONG-LIVED FORK: `origin` = `samuelchanx/zcode-acp`,
+`upstream` = `william0wang/zcode-acp`. The fork carries Paseo-critical
+features upstream lacks, and they do not protect themselves: the 0.72 merge
+(`50a686e` + resolution `5805b96`, 2026-10-17) silently dropped the quota
+CLI's `--json` mode — both Paseo quota surfaces died for half a day before
+anyone noticed, with every unit test green. After EVERY upstream merge, work
+through this section.
+
+### The machine contract that died once: `zcode-acp quota --json`
+
+- `paseo-plugin/server/quota.ts` spawns `zcode-acp quota --json` and
+  `JSON.parse`es stdout. This feeds BOTH Paseo usage sources (GLM Coding Plan
+  + Ollama Cloud on the native Usage screen). Failure signature in
+  `paseo plugin logs zcode-acp`: `quota RPC failed: Unexpected token 'G',
+  "GLM Coding"... is not valid JSON` (or `'O', "Ollama Clo"...`).
+- Upstream's quota bin IGNORES unknown flags, so a dropped `--json` renders
+  the human card instead of erroring — flag-parsing unit tests alone will not
+  catch it. Guard: the contract test in `tests/cli-quota.test.ts`
+  (`quota --json contract (paseo-plugin RPC)`) calls `main(["--json"])` and
+  requires one parseable JSON object with `glm`/`go`/`oc` keys.
+- Extra payload keys (`cp`, `cpOtherCount`, …) are fine — the plugin's zod
+  contract `bridgeQuotaSchema` (`paseo-plugin/shared/quota.ts`) strips
+  unknowns by design.
+
+### Feature inventory to verify after every merge
+
+| Fork feature | Lives in | Guarded by |
+| --- | --- | --- |
+| response-first replay for Paseo's plugin shim (load-time replay was silently dropped) | `src/handlers/replay.ts` | `tests/session-load-deferred-replay.test.ts` |
+| no-op guard for foreign config options (boolean/unknown ids broke EVERY agent load via the plugin) | `src/config/options.ts` | `tests/config-option-foreign.test.ts` |
+| resume context size from `model_usage` (`turn_usage` is a per-turn SUM — wildly oversized) + initial `usage_update` fallback after resume | `src/config/model-cache.ts` | `tests/model-cache-usage.test.ts` |
+| bare modelId advertisement so Paseo's bare-id model switch matches builtins | `src/config/options.ts` | `tests/model-select-options.test.ts` |
+| skills: project-scope `.zcode/skills` discovery, category-layout advertisement, `$` prefix strip, slash-list rebuild on session open | `src/config/skill-discovery.ts`, `src/handlers/slash.ts` | `tests/skill-discovery.test.ts`, `tests/slash-text.test.ts` |
+| bigmodel start-plan headless auth (JWT-only apiKey, no captcha headers; ADR-0008) | `src/config/account-provider.ts` | `tests/start-plan-dropdown.test.ts`, `tests/provider-runtime-headers.test.ts` |
+| quota sources: GLM + Ollama Cloud local device-auth (no API key; signed-in local Ollama answers `GET :11434/api/balance` itself) + the `--json` mode | `src/quota/ollama-cloud/`, `src/bin/quota.ts` | `tests/ollama-cloud.test.ts`, `tests/cli-quota.test.ts` |
+| paseo-plugin: usage sources, quota RPC, and the toolCall error synthesis (failed calls emitting `error:null` violate `ToolCallFailedPayloadSchema` and brick the whole timeline — "Couldn't refresh agent history" forever) | `paseo-plugin/` | `tests/paseo-plugin*.test.ts` |
+| `ZCODE_ACP_MODE` env at session create (default stays `yolo`) | `src/config/settings.ts` | covered by session tests |
+
+### Known non-features — do NOT "restore" these
+
+- The companion `ZCODE_ACP_THOUGHT_LEVEL` create-time env path (old
+  paseo-extras commit `9a51455`) was never merged into main — superseded by
+  the config-option plumbing (`set_config_option`, category
+  `thought_level`). Nothing configures the env var, so there is nothing to
+  fix; the branch is there if a host ever needs an env surface.
+- `paseo-plugin/client/quota.tsx` (435 lines) is DORMANT by design (commit
+  `0691686`): the native Usage screen replaced the custom sidebar screen and
+  the client entry is a no-op. Keep the file; don't re-register it.
+- A leftover `git stash` ("model-cache usage fallback patch" on
+  paseo-extras) predates main's model_usage-first implementation — obsolete,
+  safe to drop.
+
+### Merge procedure
+
+1. `git fetch upstream && git merge upstream/main` in a separate worktree;
+   resolve conflicts KEEPING every row of the inventory above (upstream will
+   often rewrite the same files — e.g. 0.72 rewrote the whole quota card).
+2. `pnpm build && pnpm test` — the full suite must be green, and
+   `tests/cli-quota.test.ts` must be among the files run. Before the contract
+   test existed a green suite did NOT prove the contract; also eyeball
+   `grep -n '"--json"' src/bin/quota.ts`.
+3. Deployment is automatic for src changes: `~/.local/bin/zcode-acp` is an
+   npm link into this repo, so `pnpm build` (or any rebuild of `dist/`)
+   reaches the plugin's next spawn. A `paseo plugin reload zcode-acp` is
+   needed ONLY when `paseo-plugin/` sources changed — it kills running zcode
+   agents, so run it from a plain terminal when no agents are active, never
+   from inside a Paseo-hosted session.
+4. NEVER `npm i -g zcode-acp-server@latest` — it would clobber the global
+   link with upstream's registry build.
+
 ## Docs to read before sensitive changes
 
 - `docs/ARCHITECTURE.md` — full architecture writeup

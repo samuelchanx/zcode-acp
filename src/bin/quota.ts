@@ -73,6 +73,8 @@ export interface CliOptions {
   provider: Provider;
   /** True when the user explicitly asked for the plain monochrome layout. */
   plain: boolean;
+  /** True for machine output: one JSON object (the raw CombinedResult). */
+  json: boolean;
 }
 
 /** Human-readable usage text. */
@@ -119,6 +121,11 @@ Options:
   -p, --plain              Plain monochrome bars (no color, no in-bar overlay).
                            Color is the default on a terminal; disabled
                            automatically when stdout is piped or redirected.
+  -j, --json               Machine output: one JSON object (the raw
+                           CombinedResult — glm/go/oc sum types) on stdout,
+                           then exit 0. Per-provider status travels in the
+                           body (the "kind" fields), so the exit code is
+                           always 0.
   -h, --help               Show this help and exit.
 
 Examples:
@@ -129,7 +136,8 @@ Examples:
   zcode-acp quota glm -w          # GLM only, live monitor every 30s
   zcode-acp quota -w -i 60        # all, refresh every 60s
   zcode-acp quota -d              # all, include per-model MCP breakdown
-  zcode-acp quota --plain         # all, classic monochrome bars`;
+  zcode-acp quota --plain         # all, classic monochrome bars
+  zcode-acp quota --json          # all providers, machine-readable JSON`;
 
 /**
  * Clamp a raw interval (seconds, optional) to a valid ms value. Returns the
@@ -158,6 +166,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
   let help = false;
   let detail = false;
   let plain = false;
+  let json = false;
   let interval: number | undefined;
   let provider: Provider = "all";
 
@@ -175,6 +184,10 @@ export function parseArgs(argv: readonly string[]): CliOptions {
       case "-p":
       case "--plain":
         plain = true;
+        break;
+      case "-j":
+      case "--json":
+        json = true;
         break;
       case "-h":
       case "--help":
@@ -214,6 +227,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     detail,
     help,
     plain,
+    json,
     provider,
     intervalMs: resolved.ms,
     intervalClamped: resolved.clamped,
@@ -383,6 +397,12 @@ async function runOnce(provider: Provider, detail: boolean, color: boolean): Pro
   process.stdout.write(out + "\n");
 }
 
+/** Machine output: one JSON object (the raw CombinedResult) on stdout. */
+async function runJson(provider: Provider): Promise<void> {
+  const combined = await queryCombined(provider);
+  process.stdout.write(JSON.stringify(combined) + "\n");
+}
+
 /**
  * CLI entry. Takes the argument list (defaulting to the process argv) so the
  * Unified CLI dispatcher can pass its own slice (`zcode-acp quota -w` →
@@ -395,6 +415,11 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
 
   if (opts.help) {
     process.stdout.write(HELP_TEXT + "\n");
+    return;
+  }
+
+  if (opts.json) {
+    await runJson(opts.provider);
     return;
   }
 

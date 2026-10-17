@@ -33,15 +33,30 @@ the ACP server and is never used for this):
 1. **Native Usage card (Paseo 0.11+).** A usage source maps the GLM Coding
    Plan windows (5-hour, weekly, MCP tool calls) onto Paseo's built-in Usage
    screen, with tone thresholds and reset times. Registered defensively, so
-   older daemons just skip it.
-2. **Quota screen.** A sidebar footer item (gauge icon) opens a full screen
-   with every provider the bridge covers — GLM (including per-model MCP
-   detail), Opencode Go, Ollama Cloud — plus reset countdowns and a refresh
-   button (auto-refresh every 60s; the daemon caches 30s).
+   older daemons just skip it. A second usage source maps Ollama Cloud windows
+   (local device-auth balance, plus purchased credits).
+2. **Quota screen — DORMANT.** The custom sidebar footer screen
+   (`client/quota.tsx`) was retired in commit `0691686`: Paseo's native Usage
+   screen (#1) replaced it. The client entry is a no-op; the file is kept
+   dormant for a possible comeback — don't re-register it.
+
+> **Merge warning (2026-10-17 incident).** Upstream's quota CLI has no
+> `--json` mode and silently ignores unknown flags, so an upstream merge that
+> drops the fork's flag makes every RPC return the human-readable card instead
+> of JSON: both usage sources die and `paseo plugin logs zcode-acp` fills with
+> `quota RPC failed: Unexpected token 'G', "GLM Coding"... is not valid JSON`
+> while all unit tests stay green. The contract test in
+> `tests/cli-quota.test.ts` (`quota --json contract (paseo-plugin RPC)`)
+> guards this — run it after every upstream merge. See AGENTS.md
+> "Fork-only features" for the full survival checklist.
 
 Binary resolution for the spawn: `ZCODE_ACP_QUOTA_BIN` override, then
 `zcode-acp` on the daemon's PATH, then `~/.local/bin`, `/opt/homebrew/bin`,
 `/usr/local/bin`. Errors degrade to typed unavailable states, never a crash.
+Fixing the bin needs only `pnpm build` — the plugin spawns it per RPC call; a
+`paseo plugin reload zcode-acp` is required only when `paseo-plugin/` sources
+change (and it kills running zcode agents — do it from a plain terminal, never
+from inside a Paseo-hosted session).
 
 Install (run these yourself, not from inside a Paseo-hosted agent)
 
