@@ -6,9 +6,10 @@
  */
 
 import { EventEmitter } from "node:events";
+import { realpathSync } from "node:fs";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 
 import { WebSocket, WebSocketServer } from "ws";
@@ -17,11 +18,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The session-create endpoints read the known-project whitelist from
 // tasks-index; mock the module so no real sqlite/App store is touched.
-const { listKnownWorkspacesMock } = vi.hoisted(() => ({
+// isTaskDeleted (resume tombstone guard) defaults to false — resume paths
+// must behave exactly as before unless a test opts into a tombstone.
+const { isTaskDeletedMock, listKnownWorkspacesMock } = vi.hoisted(() => ({
   listKnownWorkspacesMock: vi.fn(),
+  isTaskDeletedMock: vi.fn(async () => false),
 }));
 vi.mock("../src/tasks-index.js", () => ({
   listKnownWorkspaces: listKnownWorkspacesMock,
+  isTaskDeleted: isTaskDeletedMock,
 }));
 
 import {
@@ -1268,8 +1273,12 @@ describe("terminal launch resolution (ADR-0016)", () => {
     });
   });
 
-  it("ghostty rides AppleScript: new tab in the front window, prompt-free command", () => {
-    const src = ghosttyTabAppleScript("Ghostty", '/ws/.zcode/tmp/tui-ab12"cd.command');
+  it("ghostty rides AppleScript: new tab in the front window, auto-closing typed input", () => {
+    const src = ghosttyTabAppleScript(
+      "Ghostty",
+      '/ws/.zcode/tmp/tui-ab12"cd.command',
+      "/Users/me/proj",
+    );
     expect(src).toContain('tell application "Ghostty"');
     // activate is best-effort (try): on a LOCKED screen it fails with a
     // permission violation and would otherwise abort the whole tell block.
@@ -1277,10 +1286,19 @@ describe("terminal launch resolution (ADR-0016)", () => {
     // No windows → a fresh one; otherwise reuse the front window (no -n spawn).
     expect(src).toContain("if (count of windows) = 0 then");
     expect(src).toContain("set tgt to front window");
-    // The script runs via a surface configuration command — never `-e`, which
-    // trips Ghostty's per-launch "Allow Ghostty to Execute" gate.
+    // The tab's shell starts IN the project — the in-script `cd` only moves
+    // the child `sh`, never the terminal itself (prompt, OSC 7, inherited cwd).
+    expect(src).toContain('set initial working directory of cfg to "/Users/me/proj"');
+    // The script is TYPED into the default shell via surface configuration
+    // initial input — never `-e` (per-launch "Allow Ghostty to Execute" gate)
+    // and never `command` (force-enables wait-after-command one-way, so the
+    // tab would sit on "Press any key to close" and windows would pile up).
     expect(src).not.toContain("-e ");
-    expect(src).toContain('set command of cfg to "/bin/sh " &');
+    expect(src).not.toContain("set command of cfg");
+    expect(src).toContain('set initial input of cfg to "/bin/sh ');
+    // `; exit` + linefeed: the shell quits with the CLI tree, and the surface
+    // then closes itself (Ghostty's own open-a-script pattern).
+    expect(src).toContain("'; exit\" & linefeed");
     // AppleScript string escaping: backslash and double-quote survive.
     expect(src).toContain('\\"cd.command');
   });
@@ -1300,5 +1318,159 @@ describe("terminal TUI script (ADR-0016)", () => {
     expect(body).toContain("export ZCODE_ACP_REMOTE_ORIGIN='serve'");
     expect(body).toContain("exec '");
     expect(body).not.toContain("PATH=");
+  });
+});
+
+describe("remote projectRoots widening + GET /api/fs/list (browse-and-create)", () => {
+  const auth = { Authorization: `Bearer ${TOKEN}` };
+  // Real temp dirs; the hub's startable-dir gate only requires an existing
+  // directory (the temp-tree exclusions guard the AUTO-discovered known
+  // list, not explicitly configured roots), so tmpdir works fine here.
+  // Assertions compare against realpathSync spellings: /api/fs/list answers
+  // with the RESOLVED path (/var → /private/var on macOS).
+  let roots: string;
+  let outside: string;
+  const savedEnv: Record<string, string | undefined> = {};
+
+  beforeEach(async () => {
+    roots = await mkdtemp(path.join(tmpdir(), "zacp-hub-roots-"));
+    outside = await mkdtemp(path.join(tmpdir(), "zacp-hub-outside-"));
+    savedEnv.ZCODE_ACP_PROJECT_ROOTS = process.env.ZCODE_ACP_PROJECT_ROOTS;
+    // The hermetic HOME has no config.json → the env var decides.
+    process.env.ZCODE_ACP_PROJECT_ROOTS = roots;
+    listKnownWorkspacesMock.mockReset();
+    listKnownWorkspacesMock.mockResolvedValue([]);
+  });
+
+  afterEach(async () => {
+    if (savedEnv.ZCODE_ACP_PROJECT_ROOTS === undefined) delete process.env.ZCODE_ACP_PROJECT_ROOTS;
+    else process.env.ZCODE_ACP_PROJECT_ROOTS = savedEnv.ZCODE_ACP_PROJECT_ROOTS;
+    await Promise.all([roots, outside].map((d) => rm(d, { recursive: true, force: true })));
+  });
+
+  it("POST /api/instances accepts a NEW subdirectory under a configured root", async () => {
+    const target = path.join(roots, "fresh-project");
+    await mkdir(target);
+    const fakeChild = new EventEmitter() as EventEmitter & {
+      pid: number;
+      exitCode: number | null;
+      signalCode: string | null;
+    };
+    fakeChild.pid = 4242;
+    fakeChild.exitCode = null;
+    fakeChild.signalCode = null;
+    const spawns: Array<{ cwd: string; kind: string; env: NodeJS.ProcessEnv }> = [];
+    const hub = await startTestHub({
+      spawnServe: (opts) => {
+        spawns.push(opts as { cwd: string; kind: string; env: NodeJS.ProcessEnv });
+        return fakeChild as unknown as import("node:child_process").ChildProcess;
+      },
+    });
+    const pending = fetch(`http://127.0.0.1:${hub.port}/api/instances`, {
+      method: "POST",
+      headers: { ...auth, "Content-Type": "application/json" },
+      body: JSON.stringify({ workspacePath: target }),
+    });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawns).toHaveLength(1);
+    expect(spawns[0]!.cwd).toBe(target);
+    expect(spawns[0]!.kind).toBe("tui");
+    const reg = await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(
+        registerBody({
+          id: "serve-window",
+          workspace: target,
+          origin: "serve",
+          nonce: spawns[0]!.env.ZCODE_ACP_SPAWN_NONCE,
+        }),
+      ),
+    });
+    expect(reg.ok).toBe(true);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "serve-window", reused: false });
+  });
+
+  it("POST still refuses existing dirs outside every root and vanished paths under one", async () => {
+    let spawnCount = 0;
+    const hub = await startTestHub({
+      spawnServe: () => {
+        spawnCount++;
+        return null;
+      },
+    });
+    const url = `http://127.0.0.1:${hub.port}/api/instances`;
+    for (const workspacePath of [outside, path.join(roots, "never-created")]) {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { ...auth, "Content-Type": "application/json" },
+        body: JSON.stringify({ workspacePath }),
+      });
+      expect(res.status).toBe(403);
+      expect(await res.text()).toBe("unknown project");
+    }
+    expect(spawnCount).toBe(0);
+  });
+
+  it("GET /api/fs/list requires auth and lists home by default", async () => {
+    const hub = await startTestHub();
+    expect((await fetch(`http://127.0.0.1:${hub.port}/api/fs/list`)).status).toBe(401);
+    const res = await fetch(`http://127.0.0.1:${hub.port}/api/fs/list`, { headers: auth });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { path: string };
+    expect(body.path).toBe(realpathSync(homedir()));
+  });
+
+  it("GET /api/fs/list rejects relative and missing paths", async () => {
+    const hub = await startTestHub();
+    const rel = await fetch(`http://127.0.0.1:${hub.port}/api/fs/list?path=relative`, {
+      headers: auth,
+    });
+    expect(rel.status).toBe(400);
+    expect(await rel.text()).toBe("absolute path required");
+    const gone = await fetch(
+      `http://127.0.0.1:${hub.port}/api/fs/list?path=${path.join(roots, "nope")}`,
+      { headers: auth },
+    );
+    expect(gone.status).toBe(404);
+  });
+
+  it("GET /api/fs/list lists only subdirectories, flags creatable under a root", async () => {
+    await mkdir(path.join(roots, "b-proj"));
+    await mkdir(path.join(roots, "a-proj"));
+    await writeFile(path.join(roots, "file.txt"), "not a directory");
+    const hub = await startTestHub();
+    const res = await fetch(`http://127.0.0.1:${hub.port}/api/fs/list?path=${roots}`, {
+      headers: auth,
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      path: string;
+      parent: string;
+      creatable: boolean;
+      entries: Array<{ name: string }>;
+      truncated: boolean;
+    };
+    const realRoots = realpathSync(roots);
+    expect(body.path).toBe(realRoots);
+    expect(body.parent).toBe(path.dirname(realRoots));
+    expect(body.creatable).toBe(true); // the root itself is under a root
+    expect(body.entries).toEqual([{ name: "a-proj" }, { name: "b-proj" }]);
+    expect(body.truncated).toBe(false);
+    // Outside every root and unknown → listed fine (browse is unscoped) but
+    // NOT creatable; becoming a known project flips it without any root.
+    const outsideRes = await fetch(`http://127.0.0.1:${hub.port}/api/fs/list?path=${outside}`, {
+      headers: auth,
+    });
+    expect(((await outsideRes.json()) as { creatable: boolean }).creatable).toBe(false);
+    listKnownWorkspacesMock.mockResolvedValue([
+      { workspacePath: outside, sessions: 1, lastActive: 1 },
+    ]);
+    const knownRes = await fetch(`http://127.0.0.1:${hub.port}/api/fs/list?path=${outside}`, {
+      headers: auth,
+    });
+    expect(((await knownRes.json()) as { creatable: boolean }).creatable).toBe(true);
   });
 });

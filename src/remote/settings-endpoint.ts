@@ -76,8 +76,12 @@ import {
 } from "../settings/app-update.js";
 import { readUsageStats, type UsageRange } from "../settings/usage-stats.js";
 import {
+  amendRunSettings,
   conversationRuns,
   deleteWorkflow,
+  dismissFinishedSessionRuns,
+  dismissWorkflowRun,
+  dismissWorkflowRuns,
   getWorkflow,
   listRuns,
   listWorkflows,
@@ -91,12 +95,17 @@ import {
   runEvents,
   runNodeResult,
   runWorkspace,
+  setWorkflowGateMode,
   startSavedWorkflow,
+  stopWorkflowRun,
   updateWorkflowMeta,
   workflowCreatePrompt,
   WorkflowApiError,
+  WORKFLOW_GATE_SETTINGS,
+  type WorkflowGateModeSetting,
   type WorkflowScope,
 } from "../settings/workflow.js";
+import { workflowOverrideNow } from "../config/workflow-gate.js";
 import {
   codingPlanProviderIds,
   isCodingPlanProvider,
@@ -108,6 +117,11 @@ import {
   type ResetType,
 } from "../settings/coding-plan.js";
 import { queryQuota } from "../quota/index.js";
+import {
+  isPlatformUsageRange,
+  readPlatformUsage,
+  type PlatformUsageRange,
+} from "../quota/platform-usage.js";
 import { zcodeCliConfigPath, zcodePersonalProviderPath } from "../utils.js";
 
 /** Body size cap. Settings payloads are small; hooks are the largest. */
@@ -296,6 +310,7 @@ async function route(
   const caps = backendCapabilities(server?.backendKind ?? "zcode");
   const workflowRoute =
     path === "/settings/workflows" ||
+    path === "/settings/workflow-gate" ||
     path === "/settings/workflow-create-prompt" ||
     path === "/settings/workflow-runs" ||
     path.startsWith("/settings/workflows/") ||
@@ -318,6 +333,7 @@ async function route(
     if (path === "/settings/agents") return void (await handleAgents(res));
     if (path === "/settings/backups") return void (await handleBackups(res));
     if (path === "/settings/usage") return void (await handleUsage(res, url));
+    if (path === "/settings/usage-platform") return void (await handleUsagePlatform(res, url));
     if (path === "/settings/quota") return void (await handleQuota(res));
     if (path === "/settings/reset-cards") return void (await handleResetCards(res, url));
     if (path === "/settings/pending-restart") return void (await handlePendingRestart(res, server));
@@ -379,6 +395,9 @@ async function route(
       }
     }
 
+    if (method === "PUT" && path === "/settings/workflow-gate") {
+      return void (await handleWorkflowGateSet(res, server, body));
+    }
     if (method === "PUT" && path.startsWith("/settings/providers/")) {
       const id = segment(path.slice("/settings/providers/".length));
       return void (await handleUpdateProvider(res, id, body));
@@ -509,6 +528,46 @@ async function route(
       }
       return void (await handleWorkflowResume(res, server, runId, body));
     }
+    if (
+      method === "POST" &&
+      path.startsWith("/settings/workflow-runs/") &&
+      path.endsWith("/stop")
+    ) {
+      const runId = segment(path.slice("/settings/workflow-runs/".length, -"/stop".length));
+      if (!runId || runId.includes("/")) {
+        return sendError(res, 400, "expected /settings/workflow-runs/{runId}/stop");
+      }
+      return void (await handleWorkflowStop(res, server, runId, body));
+    }
+    // Literal segment FIRST — it would otherwise parse as `{runId}` below.
+    if (method === "POST" && path === "/settings/workflow-runs/dismiss-finished") {
+      return void (await handleWorkflowDismissFinished(res, server, body));
+    }
+    if (method === "POST" && path === "/settings/workflow-runs/dismiss-batch") {
+      return void (await handleWorkflowDismissBatch(res, server, body));
+    }
+    if (
+      method === "POST" &&
+      path.startsWith("/settings/workflow-runs/") &&
+      path.endsWith("/dismiss")
+    ) {
+      const runId = segment(path.slice("/settings/workflow-runs/".length, -"/dismiss".length));
+      if (!runId || runId.includes("/")) {
+        return sendError(res, 400, "expected /settings/workflow-runs/{runId}/dismiss");
+      }
+      return void (await handleWorkflowDismiss(res, server, runId));
+    }
+    if (
+      method === "POST" &&
+      path.startsWith("/settings/workflow-runs/") &&
+      path.endsWith("/settings")
+    ) {
+      const runId = segment(path.slice("/settings/workflow-runs/".length, -"/settings".length));
+      if (!runId || runId.includes("/")) {
+        return sendError(res, 400, "expected /settings/workflow-runs/{runId}/settings");
+      }
+      return void (await handleRunSettingsAmend(res, server, runId, body, url));
+    }
     return sendError(res, 404, "not found");
   }
 
@@ -623,8 +682,21 @@ async function readWorkflowGateBlock(server: ZcodeAcpServer): Promise<{
   enabled: boolean;
   mode: string;
   source: string;
+  override?: "disabled" | "onDemand" | "alwaysOn";
 }> {
   try {
+    // Local override first: it answers WITHOUT a backend (a cold App-only
+    // bridge must not boot one just to report its own switch), and the
+    // `override` field tells the App which toggle position produced this.
+    const override = workflowOverrideNow();
+    if (override) {
+      return {
+        enabled: override.enabled,
+        mode: override.mode,
+        source: override.source,
+        override: override.mode,
+      };
+    }
     if (!server.backendWorkflowGate) {
       await server.ensureBackend().catch((): undefined => undefined);
     }
@@ -633,6 +705,53 @@ async function readWorkflowGateBlock(server: ZcodeAcpServer): Promise<{
   } catch {
     return { enabled: false, mode: "unknown", source: "default" };
   }
+}
+
+/**
+ * PUT /settings/workflow-gate — the App settings toggle's write half (per
+ * instance mount only; the machine-level hub answers 409 via workflowGuard):
+ * persist `workflow.mode` in the user config ("auto" = delete the key, follow
+ * the remote verdict) and answer the effective verdict the NEXT gate read
+ * sees. The config is machine-level — every bridge instance on the machine
+ * picks the flip up live on its next gate consumption.
+ */
+async function handleWorkflowGateSet(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  body: Record<string, unknown>,
+): Promise<void> {
+  if (!server) {
+    // Machine-level mount: the config write itself is machine-level, but the
+    // response folds the bridge's pinned remote verdict — point the client at
+    // the per-instance spelling instead of the generic workflows hint.
+    sendError(
+      res,
+      409,
+      "workflow-gate set is per-bridge — use /api/instances/{id}/settings/workflow-gate",
+    );
+    return;
+  }
+  await workflowGuard(res, server, async (srv) => {
+    const raw = body["mode"];
+    const mode = typeof raw === "string" ? raw.trim() : "";
+    if (!WORKFLOW_GATE_SETTINGS.includes(mode as WorkflowGateModeSetting)) {
+      throw new WorkflowApiError(
+        400,
+        "invalid_mode",
+        "mode must be one of: auto, disabled, onDemand, alwaysOn",
+      );
+    }
+    try {
+      await setWorkflowGateMode(mode as WorkflowGateModeSetting);
+    } catch (e) {
+      throw new WorkflowApiError(
+        500,
+        "config_write_failed",
+        `workflow-gate config write failed: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+    return { ok: true as const, gate: await readWorkflowGateBlock(srv) };
+  });
 }
 
 /**
@@ -1029,6 +1148,23 @@ async function handleUsage(res: ServerResponse, url: URL): Promise<void> {
   await guard(res, async () => ({
     ok: true as const,
     usage: await readUsageStats(requested as UsageRange),
+  }));
+}
+
+/**
+ * Platform usage (the account-level monitor data behind the desktop app's
+ * Coding Plan usage tab). The module owns its error states, so the handler is
+ * a pure translation like handleQuota.
+ */
+async function handleUsagePlatform(res: ServerResponse, url: URL): Promise<void> {
+  const requested = url.searchParams.get("range") ?? "7d";
+  if (!isPlatformUsageRange(requested)) {
+    sendError(res, 400, "range must be one of today, 7d, 30d");
+    return;
+  }
+  await guard(res, async () => ({
+    ok: true as const,
+    platformUsage: await readPlatformUsage(requested as PlatformUsageRange),
   }));
 }
 
@@ -1571,6 +1707,122 @@ async function handleWorkflowResume(
       ...(name ? { name } : {}),
     });
     return { ok: true as const };
+  });
+}
+
+/**
+ * Stop a flying run from the management page — `session/cancelBackgroundTask`
+ * reached through the hub so a run on ANY instance is stoppable, not just the
+ * one the client's ACP socket is bound to.
+ */
+async function handleWorkflowStop(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  runId: string,
+  body: Record<string, unknown>,
+): Promise<void> {
+  const sessionId = str(body, "sessionId");
+  await workflowGuard(res, server, async (srv) => {
+    if (!sessionId) {
+      throw new WorkflowApiError(400, "invalid_request", "sessionId is required");
+    }
+    await stopWorkflowRun(srv, { runId, acpSessionId: sessionId });
+    return { ok: true as const };
+  });
+}
+
+/**
+ * Hide one settled run from the bridge's run lists (bridge-side hide list —
+ * the journal itself has no delete and stays untouched). 409 while the run
+ * is still flying; see dismissWorkflowRun for the semantics.
+ */
+async function handleWorkflowDismiss(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  runId: string,
+): Promise<void> {
+  await workflowGuard(res, server, async (srv) => dismissWorkflowRun(srv, runId));
+}
+
+/** Hide every SETTLED run of one session (body `{sessionId}`, the ACP id). */
+async function handleWorkflowDismissFinished(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  body: Record<string, unknown>,
+): Promise<void> {
+  const sessionId = str(body, "sessionId");
+  await workflowGuard(res, server, async (srv) => {
+    if (!sessionId) {
+      throw new WorkflowApiError(400, "invalid_request", "sessionId is required");
+    }
+    return dismissFinishedSessionRuns(srv, sessionId);
+  });
+}
+
+/** Batch hide by explicit ids (body `{runIds}`); still-running ids are skipped. */
+async function handleWorkflowDismissBatch(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  body: Record<string, unknown>,
+): Promise<void> {
+  const runIds = body["runIds"];
+  await workflowGuard(res, server, async (srv) => {
+    if (!Array.isArray(runIds) || runIds.some((id) => typeof id !== "string")) {
+      throw new WorkflowApiError(400, "invalid_request", "runIds (string[]) is required");
+    }
+    return dismissWorkflowRuns(srv, runIds as string[]);
+  });
+}
+
+/**
+ * Amend a run's settings (three-state per field: absent = keep, `null` =
+ * revert to default, value = set). The body carries ONLY the settings delta —
+ * the session is addressed by `?sessionId=`, the run by the path segment
+ * (the run-query family on this prefix). The response's `runId` is the run
+ * that continues the work; `supersededRunId` appears only when the amendment
+ * stopped and replaced a flying run, and the client re-points its view then.
+ */
+async function handleRunSettingsAmend(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  runId: string,
+  body: Record<string, unknown>,
+  url: URL,
+): Promise<void> {
+  const sessionId = url.searchParams.get("sessionId");
+  await workflowGuard(res, server, async (srv) => {
+    if (!sessionId) throw new WorkflowApiError(400, "invalid_query", "sessionId is required");
+    // Three-state extraction is by KEY PRESENCE — reading through str()/num()
+    // would map the documented `null` clears to "absent" and make them unreachable.
+    const hasModel = "subagentModel" in body;
+    const hasConcurrency = "maxConcurrency" in body;
+    const model = body["subagentModel"];
+    const concurrency = body["maxConcurrency"];
+    if (hasModel && model !== null && (typeof model !== "string" || model.length === 0)) {
+      throw new WorkflowApiError(
+        400,
+        "invalid_request",
+        "subagentModel must be a non-empty string or null",
+      );
+    }
+    if (
+      hasConcurrency &&
+      concurrency !== null &&
+      (typeof concurrency !== "number" || !Number.isInteger(concurrency) || concurrency < 1)
+    ) {
+      throw new WorkflowApiError(
+        400,
+        "invalid_request",
+        "maxConcurrency must be an integer >= 1 or null",
+      );
+    }
+    const amended = await amendRunSettings(srv, {
+      runId,
+      acpSessionId: sessionId,
+      ...(hasModel ? { subagentModel: model as string | null } : {}),
+      ...(hasConcurrency ? { maxConcurrency: concurrency as number | null } : {}),
+    });
+    return { ok: true as const, ...amended };
   });
 }
 

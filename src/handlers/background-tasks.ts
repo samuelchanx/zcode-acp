@@ -39,6 +39,7 @@ import { messages } from "../i18n.js";
 import { log, warn } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { armWorkflowRunPoller, stopWorkflowRunPoller } from "../workflow/poller.js";
+import { pushSettled, pushSourceLabel } from "../push/push.js";
 
 /** Shape of a `session.updated` payload that reports a background task state. */
 interface TaskStatusPayload {
@@ -94,6 +95,8 @@ interface TrackedTask {
    * lifecycle); the run poller addresses progress to acpCallId.
    */
   foldedIntoToolCard?: boolean;
+  /** Terminal-status offline push already sent (§5.3 dedup). */
+  terminalPushed?: boolean;
   /**
    * Cumulative output snapshot this listener has already streamed via
    * terminal_output for a reused launch card. Tracked SEPARATELY from
@@ -143,6 +146,19 @@ export class BackgroundTaskListener implements EventListener {
           // taskId is verified string above; cast to the full shape (other
           // fields are optional and read defensively inside onTaskStatus).
           void this.onTaskStatus(raw as TaskStatusPayload);
+          return;
+        }
+        // Out-of-turn mode transitions (SessionModeChanged rides this generic
+        // wire type with a raw {mode, planEnabled} payload): keep the tracked
+        // plan flag truthful for the read paths. No broadcast from here — the
+        // turn-path dispatcher owns client notification; this only feeds
+        // buildModes/buildConfigOptions.
+        const p = (raw ?? {}) as Record<string, unknown>;
+        if (typeof p["mode"] === "string" && typeof p["planEnabled"] === "boolean") {
+          const planEnabled = p["planEnabled"] === true;
+          if (planEnabled) this.server.sessionPlanActive.add(this.zcodeSid);
+          else this.server.sessionPlanActive.delete(this.zcodeSid);
+          log(`  [bg] mode transition: ${p["mode"]} plan=${planEnabled}`);
         }
         return;
       }
@@ -230,7 +246,11 @@ export class BackgroundTaskListener implements EventListener {
           });
           if (acpStatus !== "in_progress") stopWorkflowRunPoller(taskId);
           else {
-            armWorkflowRunPoller(this.server, this.zcodeSid, { runId: taskId, toolCallId: cardId });
+            armWorkflowRunPoller(this.server, this.zcodeSid, {
+              runId: taskId,
+              toolCallId: cardId,
+              name: this.server.workflowRunNames.get(taskId),
+            });
           }
           log(
             `  [bg] workflow run ${taskId.slice(-12)} → progress folded into card ${cardId.slice(-12)}`,
@@ -309,11 +329,36 @@ export class BackgroundTaskListener implements EventListener {
         armWorkflowRunPoller(this.server, this.zcodeSid, {
           runId: taskId,
           toolCallId: task.acpCallId,
+          name: this.server.workflowRunNames.get(taskId),
         });
       }
+      if (acpStatus !== "in_progress") this.pushTaskTerminal(task, p, acpStatus);
       return;
     }
     await this.emitStatusUpdate(task, acpStatus, p);
+  }
+
+  /**
+   * Offline push for a terminal background-task status (§5.3). Workflow runs
+   * are excluded — they push via the poller's `kind:"run"` hook, and pushing
+   * here too would notify twice for one run. One push per task: terminal
+   * status events can repeat (reusesLaunchCard updates are not deduped), so
+   * the sent flag lives on the tracked task.
+   */
+  private pushTaskTerminal(
+    task: TrackedTask,
+    p: TaskStatusPayload,
+    acpStatus: "completed" | "failed",
+    exitCode?: number,
+  ): void {
+    if (task.terminalPushed || p.taskKind === "workflow") return;
+    task.terminalPushed = true;
+    pushSettled(this.server, {
+      kind: "task",
+      label: pushSourceLabel(this.server),
+      title: "background task done",
+      body: exitCode !== undefined ? `exit ${exitCode} · ${acpStatus}` : acpStatus,
+    });
   }
 
   /**
@@ -402,12 +447,14 @@ export class BackgroundTaskListener implements EventListener {
       });
       this.server.terminalSentData.delete(task.sourceToolCallId);
       task.lastStatus = acpStatus;
+      this.pushTaskTerminal(task, p, acpStatus, exitCode);
       log(`  [bg] launch card ${task.sourceToolCallId.slice(-12)} → ${acpStatus} (terminal_exit)`);
       return;
     }
 
     // Subsequent sighting (bg_* card) or non-terminal → status update only.
     if (task.lastStatus === acpStatus) return;
+    if (isTerminal) this.pushTaskTerminal(task, p, acpStatus);
     const ok = await this.server.notifyByZcodeSid(this.zcodeSid, {
       sessionUpdate: "tool_call_update",
       toolCallId: task.acpCallId,

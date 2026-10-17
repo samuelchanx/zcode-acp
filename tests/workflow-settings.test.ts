@@ -16,13 +16,14 @@
  */
 
 import { createServer } from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ZcodeBackend } from "../src/backend/client.js";
+import { recordMaterializedSession } from "../src/lazy-sessions.js";
 import { captureGate, type WorkflowGate } from "../src/config/workflow-gate.js";
 import { startHub, type HubHandle } from "../src/remote/hub-server.js";
 import { createSettingsHandler } from "../src/remote/settings-endpoint.js";
@@ -302,6 +303,143 @@ describe("workflow settings — gate and mount guards", () => {
     const body = (await res.json()) as { workflows: Array<{ name: string }> };
     expect(body.workflows[0]!.name).toBe("deploy");
   });
+
+  it("a 403 body carries the verdict's mode and source (pulled vs broken fetch)", async () => {
+    const { server } = makeBridge(GATE_OFF);
+    const port = await serveSettings(server);
+    const res = await get(port, "workflows");
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string; message?: string };
+    expect(body.error).toBe("workflow_disabled");
+    expect(body.message).toBe("gate mode=disabled source=remote");
+  });
+});
+
+describe("workflow settings — gate switch (PUT /settings/workflow-gate)", () => {
+  /** The per-test temp home's user config path (HOME is stubbed per test). */
+  function configPath(): string {
+    return path.join(home, ".config", "zcode-acp", "config.json");
+  }
+
+  it("PUT alwaysOn persists workflow.mode and answers the override verdict", async () => {
+    const { server } = makeBridge(GATE_OFF); // pinned remote says disabled…
+    const port = await serveSettings(server);
+
+    const res = await send(port, "PUT", "workflow-gate", { mode: "alwaysOn" });
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      ok: true,
+      gate: { enabled: true, mode: "alwaysOn", source: "override", override: "alwaysOn" },
+    });
+    const saved = JSON.parse(await readFile(configPath(), "utf8")) as {
+      workflow?: { mode?: string };
+    };
+    expect(saved.workflow?.mode).toBe("alwaysOn");
+
+    // …and the override now wins live: the same GATE_OFF bridge serves the
+    // workflow surface, and the policy push reaches the backend process.
+    const list = await get(port, "workflows");
+    expect(list.status).toBe(200);
+  });
+
+  it("a local override on a disabled gate also fires the per-generation policy push", async () => {
+    const { server, calls } = makeBridge(GATE_OFF, {
+      results: { "workflows/list": { workflows: [], invalid: [], dir: "/d" } },
+    });
+    const port = await serveSettings(server);
+    await send(port, "PUT", "workflow-gate", { mode: "alwaysOn" });
+    await get(port, "workflows");
+    expect(calls.find((c) => c.method === "workspace/updateDynamicWorkflowPolicy")).toBeTruthy();
+  });
+
+  it("PUT disabled refuses every workflow route even under a GATE_ON remote", async () => {
+    const { server } = makeBridge(GATE_ON); // remote verdict says enabled…
+    const port = await serveSettings(server);
+
+    const put = await send(port, "PUT", "workflow-gate", { mode: "disabled" });
+    expect(put.status).toBe(200);
+
+    // …but the explicit local OFF wins: same 403 shape, override-sourced
+    // message (the App maps source=override to "switched off locally").
+    const list = await get(port, "workflows");
+    expect(list.status).toBe(403);
+    const body = (await list.json()) as { error: string; message?: string };
+    expect(body.error).toBe("workflow_disabled");
+    expect(body.message).toBe("gate mode=disabled source=override");
+  });
+
+  it("an override-on launch carries dynamicWorkflowEnabled on session/create (workflowFlag path)", async () => {
+    const { server, calls } = makeBridge(GATE_OFF);
+    const port = await serveSettings(server);
+    await send(port, "PUT", "workflow-gate", { mode: "alwaysOn" });
+
+    const res = await send(port, "POST", "workflows/project/deploy/start", {});
+    expect(res.status).toBe(200);
+    expect(calls.find((c) => c.method === "session/create")!.params).toMatchObject({
+      dynamicWorkflowEnabled: true,
+    });
+  });
+
+  it("PUT auto deletes the key — the gate falls back to the pinned remote verdict", async () => {
+    const { server } = makeBridge(GATE_OFF);
+    const port = await serveSettings(server);
+    await send(port, "PUT", "workflow-gate", { mode: "alwaysOn" });
+
+    const res = await send(port, "PUT", "workflow-gate", { mode: "auto" });
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      ok: true,
+      gate: { enabled: false, mode: "disabled", source: "remote" },
+    });
+    const saved = JSON.parse(await readFile(configPath(), "utf8")) as Record<string, unknown>;
+    expect(saved.workflow).toBeUndefined();
+
+    const list = await get(port, "workflows");
+    expect(list.status).toBe(403);
+  });
+
+  it("PUT auto on a config with sibling keys preserves them (raw read-modify-write)", async () => {
+    const { server } = makeBridge(GATE_ON);
+    const port = await serveSettings(server);
+    await send(port, "PUT", "workflow-gate", { mode: "disabled" });
+    await send(port, "PUT", "workflow-gate", { mode: "auto" });
+    const saved = JSON.parse(await readFile(configPath(), "utf8")) as Record<string, unknown>;
+    expect(saved.workflow).toBeUndefined();
+    expect(saved.junk).toBeUndefined(); // nothing else was written; the leaf is gone
+  });
+
+  it("an invalid mode answers 400 and writes nothing", async () => {
+    const { server } = makeBridge(GATE_ON);
+    const port = await serveSettings(server);
+    const res = await send(port, "PUT", "workflow-gate", { mode: "yes" });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("invalid_mode");
+    await expect(readFile(configPath(), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("the machine-level (hub) mount answers 409 (per-instance only)", async () => {
+    const res = await fetch(`http://127.0.0.1:${hub.port}/api/settings/workflow-gate`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "alwaysOn" }),
+    });
+    expect(res.status).toBe(409);
+  });
+
+  it("/settings/all reports the override verdict with the override field", async () => {
+    const { server } = makeBridge(GATE_OFF);
+    const port = await serveSettings(server);
+    await send(port, "PUT", "workflow-gate", { mode: "onDemand" });
+    const body = (await (await get(port, "all")).json()) as {
+      workflow: { enabled: boolean; mode: string; source: string; override?: string };
+    };
+    expect(body.workflow).toEqual({
+      enabled: true,
+      mode: "onDemand",
+      source: "override",
+      override: "onDemand",
+    });
+  });
 });
 
 describe("workflow settings — management passthrough", () => {
@@ -347,6 +485,39 @@ describe("workflow settings — management passthrough", () => {
     expect(calls.filter((c) => c.method === "workflows/runs").at(-1)!.params).toMatchObject({
       limit: 20,
     });
+  });
+
+  it("run rows carry an attachable acpSessionId — in-memory first, alias store fallback", async () => {
+    // A store-only alias: a session materialized by an earlier bridge
+    // generation — the restart case the durable store exists for.
+    recordMaterializedSession("acp_store_alias", "sess_zcode_stale", "/tmp/wf-proj");
+    const { server } = makeBridge(GATE_ON, {
+      results: {
+        "workflows/runs": {
+          runs: [
+            { runId: "r-live", parentSessionId: "sess_zcode_app" },
+            { runId: "r-store", parentSessionId: "sess_zcode_stale" },
+            { runId: "r-ghost", parentSessionId: "sess_zcode_unknown" },
+            { runId: "r-old" }, // journal rows pre-dating parentSessionId
+          ],
+        },
+      },
+    });
+    // In-memory mapping: this process attached the session.
+    provideSession(server);
+    const port = await serveSettings(server);
+
+    const res = await get(port, "workflows/runs");
+    const body = (await res.json()) as { runs: Array<Record<string, unknown>> };
+    expect(body.runs.find((r) => r.runId === "r-live")).toMatchObject({
+      acpSessionId: "sess_app",
+    });
+    expect(body.runs.find((r) => r.runId === "r-store")).toMatchObject({
+      acpSessionId: "acp_store_alias",
+    });
+    // Unresolvable and absent parents stay bare — the app keeps them read-only.
+    expect(body.runs.find((r) => r.runId === "r-ghost")!.acpSessionId).toBeUndefined();
+    expect(body.runs.find((r) => r.runId === "r-old")!.acpSessionId).toBeUndefined();
   });
 
   it("rejects an unknown scope with 400", async () => {
@@ -682,6 +853,352 @@ describe("workflow settings — resume", () => {
   });
 });
 
+describe("workflow settings — stop", () => {
+  it("stop cancelled answers 200 and sends the plain cancel RPC under the backend sid", async () => {
+    const { server, calls } = makeBridge(GATE_ON, {
+      results: { "session/cancelBackgroundTask": { cancelled: true } },
+    });
+    provideSession(server);
+    const port = await serveSettings(server);
+
+    const res = await send(port, "POST", "workflow-runs/run-9/stop", { sessionId: "sess_app" });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { ok: boolean }).ok).toBe(true);
+    // taskId ≡ runId — the same identity equation resume/amend use.
+    expect(calls.find((c) => c.method === "session/cancelBackgroundTask")!.params).toMatchObject({
+      sessionId: "sess_zcode_app",
+      taskId: "run-9",
+    });
+  });
+
+  it("stop on an already-settled run (cancelled:false) answers 409 not_running", async () => {
+    const { server } = makeBridge(GATE_ON, {
+      results: { "session/cancelBackgroundTask": { cancelled: false } },
+    });
+    provideSession(server);
+    const port = await serveSettings(server);
+
+    const res = await send(port, "POST", "workflow-runs/run-9/stop", { sessionId: "sess_app" });
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe("not_running");
+  });
+
+  it("stop without a sessionId answers 400", async () => {
+    const { server } = makeBridge(GATE_ON);
+    const port = await serveSettings(server);
+    const res = await send(port, "POST", "workflow-runs/run-9/stop", {});
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("invalid_request");
+  });
+});
+
+describe("workflow settings — run settings amendment", () => {
+  it("accepted in-place change (maxConcurrency only) answers 200 with the same run and no supersededRunId", async () => {
+    const { server, calls } = makeBridge(GATE_ON, {
+      ack: {
+        status: "accepted",
+        result: { type: "amendWorkflowRunSettings", runId: "run-9", toolCallId: "settings-1" },
+      },
+    });
+    provideSession(server);
+    const port = await serveSettings(server);
+
+    const res = await send(port, "POST", "workflow-runs/run-9/settings?sessionId=sess_app", {
+      maxConcurrency: 4,
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).toMatchObject({ ok: true, runId: "run-9", toolCallId: "settings-1" });
+    expect("supersededRunId" in body).toBe(false);
+
+    const command = calls.find((c) => c.method === "v4/command")!;
+    expect(command.params).toMatchObject({
+      sessionId: "sess_zcode_app",
+      type: "amendWorkflowRunSettings",
+      payload: { workId: "run-9", maxConcurrency: 4 },
+    });
+    // Absent keys stay absent — omission is the "keep" state.
+    expect(command.params).not.toHaveProperty("payload.subagentModel");
+  });
+
+  it("accepted supersede (subagentModel on a flying run) returns the NEW run plus supersededRunId", async () => {
+    const { server, calls } = makeBridge(GATE_ON, {
+      ack: {
+        status: "accepted",
+        result: {
+          type: "amendWorkflowRunSettings",
+          runId: "run-10",
+          toolCallId: "settings-2",
+          supersededRunId: "run-9",
+        },
+      },
+    });
+    provideSession(server);
+    const port = await serveSettings(server);
+
+    const res = await send(port, "POST", "workflow-runs/run-9/settings?sessionId=sess_app", {
+      subagentModel: "account/bigmodel-individual-coding-plan/GLM-5.3$high",
+    });
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      ok: true,
+      runId: "run-10",
+      toolCallId: "settings-2",
+      supersededRunId: "run-9",
+    });
+    expect(calls.find((c) => c.method === "v4/command")!.params).toMatchObject({
+      type: "amendWorkflowRunSettings",
+      payload: {
+        workId: "run-9",
+        subagentModel: "account/bigmodel-individual-coding-plan/GLM-5.3$high",
+      },
+    });
+  });
+
+  it("`null` is a real value (clears), not an omission — three-state on the wire", async () => {
+    const { server, calls } = makeBridge(GATE_ON, {
+      ack: {
+        status: "accepted",
+        result: { type: "amendWorkflowRunSettings", runId: "run-9", toolCallId: "settings-3" },
+      },
+    });
+    provideSession(server);
+    const port = await serveSettings(server);
+
+    const res = await send(port, "POST", "workflow-runs/run-9/settings?sessionId=sess_app", {
+      subagentModel: null,
+      maxConcurrency: null,
+    });
+    expect(res.status).toBe(200);
+    const command = calls.find((c) => c.method === "v4/command")!;
+    expect(command.params).toMatchObject({
+      payload: { workId: "run-9", subagentModel: null, maxConcurrency: null },
+    });
+  });
+
+  it("an empty delta answers 422 unchanged without any backend RPC", async () => {
+    const { server, calls } = makeBridge(GATE_ON);
+    provideSession(server);
+    const port = await serveSettings(server);
+
+    const res = await send(port, "POST", "workflow-runs/run-9/settings?sessionId=sess_app", {});
+    expect(res.status).toBe(422);
+    expect(await res.json()).toMatchObject({ ok: false, error: "unchanged" });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("maps each rejection token to its fixed §2.2 status", async () => {
+    const cases: Array<[string, number]> = [
+      ["not_found", 404],
+      ["not_configurable", 409],
+      ["unchanged", 409],
+      ["missing_boundaries", 409],
+      ["model_unavailable", 422],
+      ["script_missing", 422],
+      ["compile_failed", 422],
+      ["start_failed", 502],
+    ];
+    for (const [token, status] of cases) {
+      const { server } = makeBridge(GATE_ON, {
+        ack: {
+          status: "rejected",
+          reasonCode: `fault.command.workflowRunSettingsRejected.${token}`,
+          message: `amend ${token}`,
+        },
+      });
+      provideSession(server);
+      const port = await serveSettings(server);
+      const res = await send(port, "POST", "workflow-runs/run-9/settings?sessionId=sess_app", {
+        maxConcurrency: 2,
+      });
+      expect(res.status, token).toBe(status);
+      await expect(res.json(), token).resolves.toMatchObject({ ok: false, error: token });
+    }
+  }, 20_000);
+
+  it("an accepted ack missing runId/toolCallId answers 502 — the app must never lose its re-point target", async () => {
+    const { server } = makeBridge(GATE_ON, { ack: { status: "accepted" } });
+    provideSession(server);
+    const port = await serveSettings(server);
+    const res = await send(port, "POST", "workflow-runs/run-9/settings?sessionId=sess_app", {
+      maxConcurrency: 2,
+    });
+    expect(res.status).toBe(502);
+    expect(((await res.json()) as { error: string }).error).toBe("command_failed");
+  });
+
+  it("capability absence answers 501 like resume (V4CapabilityUnsupportedError wire form)", async () => {
+    const { server } = makeBridge(GATE_ON, {
+      ack: { status: "failed", reasonCode: "fault.command.capabilityUnsupported" },
+    });
+    provideSession(server);
+    const port = await serveSettings(server);
+    const res = await send(port, "POST", "workflow-runs/run-9/settings?sessionId=sess_app", {
+      maxConcurrency: 2,
+    });
+    expect(res.status).toBe(501);
+    expect(((await res.json()) as { error: string }).error).toBe("capabilityUnsupported");
+  });
+
+  it("a missing sessionId answers 400 invalid_query", async () => {
+    const { server } = makeBridge(GATE_ON);
+    const port = await serveSettings(server);
+    const res = await send(port, "POST", "workflow-runs/run-9/settings", { maxConcurrency: 2 });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("invalid_query");
+  });
+
+  it("malformed values answer 400 invalid_request before any RPC", async () => {
+    const { server, calls } = makeBridge(GATE_ON);
+    provideSession(server);
+    const port = await serveSettings(server);
+
+    for (const bad of [{ subagentModel: "" }, { subagentModel: 7 }, { maxConcurrency: 0 }]) {
+      const res = await send(port, "POST", "workflow-runs/run-9/settings?sessionId=sess_app", bad);
+      expect(res.status, JSON.stringify(bad)).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBe("invalid_request");
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  it("is registered for POST only (PUT falls through to 404)", async () => {
+    const { server } = makeBridge(GATE_ON);
+    provideSession(server);
+    const port = await serveSettings(server);
+    const res = await send(port, "PUT", "workflow-runs/run-9/settings?sessionId=sess_app", {
+      maxConcurrency: 2,
+    });
+    expect(res.status).toBe(404);
+  });
+});
+
+describe("workflow settings — parity passthrough (lineage + run settings)", () => {
+  // §3.1/§3.2 of the workflow-parity requirements: the bridge serves both run
+  // surfaces RAW. These tests pin the five parity fields end-to-end with the
+  // FUTURE backend shapes, so a bridge change that starts filtering/reshaping
+  // rows (e.g. a zod re-parse that strips unknown keys) fails here before the
+  // App ever sees its lineage chips or settings sheet break.
+  it("conversation summary rows serve all five parity fields untouched", async () => {
+    const rows = [
+      {
+        runId: "r-new",
+        toolCallId: "call-2",
+        label: "deploy",
+        updatedAt: 1759000000000,
+        status: "running",
+        resumedFrom: "r-old",
+        resumable: false,
+        subagentModel: "account/bigmodel-individual-coding-plan/GLM-5.3$high",
+        maxConcurrency: 4,
+        concurrencyCeiling: 8,
+      },
+      {
+        runId: "r-old",
+        toolCallId: "call-1",
+        status: "stopped",
+        stopReason: "superseded",
+        supersededBy: "r-new",
+        resumable: true,
+      },
+    ];
+    const { server } = makeBridge(GATE_ON, {
+      results: { "v4/conversation/workflowRuns": { runs: rows } },
+    });
+    provideSession(server);
+    const port = await serveSettings(server);
+
+    const body = (await (await get(port, "workflow-runs?sessionId=sess_app")).json()) as {
+      runs: unknown[];
+    };
+    expect(body.runs).toEqual(rows);
+  });
+
+  it("history rows keep resumedFrom/supersededBy when the backend provides them", async () => {
+    const rows = [
+      {
+        runId: "h1",
+        name: "deploy",
+        status: "stopped",
+        stopReason: "superseded",
+        supersededBy: "h2",
+        createdAt: 1759000000000,
+        updatedAt: 1759000001000,
+      },
+      { runId: "h2", name: "deploy", status: "running", resumedFrom: "h1" },
+    ];
+    const { server } = makeBridge(GATE_ON, {
+      results: { "workflows/runs": { runs: rows } },
+    });
+    const port = await serveSettings(server);
+
+    const body = (await (await get(port, "workflows/runs")).json()) as { runs: unknown[] };
+    expect(body.runs).toEqual(rows);
+  });
+
+  it("supersededBy is never served without stopReason superseded (either run surface)", async () => {
+    // §4 criterion 4 — the invariant the App's lineage chips rely on. The
+    // bridge serves rows raw, so it cannot fix bad backend data; what this
+    // pins is that the passthrough does not BREAK the pairing (a future row
+    // projection that dropped stopReason while keeping supersededBy fails
+    // here). Fixtures are well-formed; the check runs on what was served.
+    const rows = [
+      {
+        runId: "r-new",
+        status: "running",
+        resumedFrom: "r-old",
+        resumable: false,
+      },
+      {
+        runId: "r-old",
+        status: "stopped",
+        stopReason: "superseded",
+        supersededBy: "r-new",
+        resumable: true,
+      },
+      {
+        runId: "r-cancelled",
+        status: "stopped",
+        stopReason: "cancelled",
+        resumable: true,
+      },
+    ];
+    const { server } = makeBridge(GATE_ON, {
+      results: {
+        "v4/conversation/workflowRuns": { runs: rows },
+        "workflows/runs": {
+          runs: [
+            {
+              runId: "h-old",
+              name: "deploy",
+              status: "stopped",
+              stopReason: "superseded",
+              supersededBy: "h-new",
+            },
+            { runId: "h-new", name: "deploy", status: "running", resumedFrom: "h-old" },
+          ],
+        },
+      },
+    });
+    provideSession(server);
+    const port = await serveSettings(server);
+
+    const served = (await (await get(port, "workflow-runs?sessionId=sess_app")).json()) as {
+      runs: Array<{ supersededBy?: string; stopReason?: string }>;
+    };
+    for (const row of served.runs) {
+      expect(row.supersededBy === undefined || row.stopReason === "superseded").toBe(true);
+    }
+
+    // Same check on the history surface.
+    const history = (await (await get(port, "workflows/runs")).json()) as {
+      runs: Array<{ supersededBy?: string; stopReason?: string }>;
+    };
+    for (const row of history.runs) {
+      expect(row.supersededBy === undefined || row.stopReason === "superseded").toBe(true);
+    }
+  });
+});
+
 describe("workflow settings — create prompt", () => {
   it("returns the frozen desktop text (stable, non-empty, scope-aware)", async () => {
     const { server } = makeBridge(GATE_ON);
@@ -701,5 +1218,113 @@ describe("workflow settings — create prompt", () => {
     expect(global.prompt).toBe(
       'Help me design a workflow and save it as a global workflow (scope: "global") with SaveWorkflow once it works: ',
     );
+  });
+});
+
+// ---------- run dismissal (bridge-side hide list) ----------
+
+describe("workflow settings — run dismissal", () => {
+  // Factories, not shared constants: stripDismissedRuns mutates the canned
+  // result in place, and a shared object would leak one test's strip into
+  // the next test's canned data.
+  const journalRuns = () => ({
+    runs: [
+      { runId: "r-done", parentSessionId: "sess_zcode_app", status: "completed" },
+      { runId: "r-live", parentSessionId: "sess_zcode_app", status: "running" },
+    ],
+  });
+  const convRuns = () => ({
+    runs: [
+      { runId: "r-done", status: "completed" },
+      { runId: "r-fail", status: "failed" },
+      { runId: "r-live", status: "running" },
+    ],
+  });
+
+  it("dismisses a settled run and hides it from both list paths", async () => {
+    const { server } = makeBridge(GATE_ON, {
+      results: {
+        "workflows/runs": journalRuns(),
+        "v4/conversation/workflowRuns": convRuns(),
+      },
+    });
+    provideSession(server);
+    const port = await serveSettings(server);
+
+    const res = await send(port, "POST", "workflow-runs/r-done/dismiss");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, dismissed: true });
+
+    const journal = (await (await get(port, "workflows/runs")).json()) as {
+      runs: Array<{ runId: string }>;
+    };
+    expect(journal.runs.map((r) => r.runId)).toEqual(["r-live"]);
+
+    const conv = (await (await get(port, "workflow-runs?sessionId=sess_app")).json()) as {
+      runs: Array<{ runId: string }>;
+    };
+    expect(conv.runs.map((r) => r.runId)).toEqual(["r-fail", "r-live"]);
+  });
+
+  it("refuses to dismiss a flying run with 409 run_active", async () => {
+    const { server } = makeBridge(GATE_ON, {
+      results: { "workflows/runs": journalRuns() },
+    });
+    const port = await serveSettings(server);
+
+    const res = await send(port, "POST", "workflow-runs/r-live/dismiss");
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: "run_active" });
+    // Nothing was recorded — the row still lists.
+    const journal = (await (await get(port, "workflows/runs")).json()) as {
+      runs: Array<{ runId: string }>;
+    };
+    expect(journal.runs.map((r) => r.runId)).toContain("r-live");
+  });
+
+  it("dismiss-finished hides every settled run of the session, keeping active ones", async () => {
+    const { server } = makeBridge(GATE_ON, {
+      results: { "v4/conversation/workflowRuns": convRuns() },
+    });
+    provideSession(server);
+    const port = await serveSettings(server);
+
+    const res = await send(port, "POST", "workflow-runs/dismiss-finished", {
+      sessionId: "sess_app",
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, dismissed: 2 });
+
+    const conv = (await (await get(port, "workflow-runs?sessionId=sess_app")).json()) as {
+      runs: Array<{ runId: string }>;
+    };
+    expect(conv.runs.map((r) => r.runId)).toEqual(["r-live"]);
+  });
+
+  it("dismiss-finished without a sessionId is a 400", async () => {
+    const { server } = makeBridge(GATE_ON, {});
+    const port = await serveSettings(server);
+
+    const res = await send(port, "POST", "workflow-runs/dismiss-finished", {});
+    expect(res.status).toBe(400);
+  });
+
+  it("dismiss-batch skips flying runs and hides the settled ones", async () => {
+    const { server } = makeBridge(GATE_ON, {
+      results: { "workflows/runs": journalRuns() },
+    });
+    const port = await serveSettings(server);
+
+    const res = await send(port, "POST", "workflow-runs/dismiss-batch", {
+      runIds: ["r-done", "r-live", "r-ghost"],
+    });
+    expect(res.status).toBe(200);
+    // r-ghost sits outside the journal window (long settled) → dismissible.
+    expect(await res.json()).toMatchObject({ ok: true, dismissed: 2, skippedActive: 1 });
+
+    const journal = (await (await get(port, "workflows/runs")).json()) as {
+      runs: Array<{ runId: string }>;
+    };
+    expect(journal.runs.map((r) => r.runId)).toEqual(["r-live"]);
   });
 });

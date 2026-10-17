@@ -343,7 +343,21 @@ export function throwError(code: number, message: string): never {
 }
 
 /**
- * Broadcast `$/zcode/turnState {running}` for every ACP alias of the session.
+ * Turn-state notification method names, old and new.
+ *
+ * The original `$/zcode/turnState` spelling follows the LSP convention, but
+ * ACP reserves `_`-prefixed names for extension notifications (#311) —
+ * `_zcode/turnState` is the spec-compliant spelling (strict routers like the
+ * Python `agent-client-protocol` library error on `$/`). Both are emitted per
+ * transition during the migration window; `$/` is deprecated and will be
+ * dropped once consumers (martty, zcode-acp-remote) move over. Clients must
+ * subscribe to exactly ONE name or they see every transition twice.
+ */
+export const TURN_STATE_METHODS = ["$/zcode/turnState", "_zcode/turnState"] as const;
+
+/**
+ * Broadcast the turn-state notification pair for every ACP alias of the
+ * session ({@link TURN_STATE_METHODS} — see its doc for the naming story).
  *
  * The single emit path for ALL turn-state reporting — the turn loop, the
  * cancel/early-return paths and the auto-compact busy window (which reports
@@ -351,18 +365,33 @@ export function throwError(code: number, message: string): never {
  * client that tracks only turns reads every busy window, not just model turns.
  * `cx` targets one connection; without it the notification fans out to every
  * attached client. Failures are per-alias and logged, never thrown.
+ *
+ * The END transition (running:false) may carry the turn's ACP usage block
+ * (`usage`, plus `turnMs` wall time): PromptResponse.usage reaches only the
+ * client that SENT the prompt, so an attach-only client (zcode-acp-remote
+ * watching a turn driven from the TUI or the editor) would never see cache /
+ * speed readouts without this. Additive fields — clients that read only
+ * `running` are unaffected.
  */
 export async function emitSessionTurnState(
   server: ZcodeAcpServer,
   acpSid: string,
   running: boolean,
   cx?: acp.AgentContext,
+  extras?: { usage?: acp.Usage; turnMs?: number },
 ): Promise<void> {
   const targetCx = cx ?? server.clients.broadcast();
+  const params: Record<string, unknown> = { sessionId: acpSid, running };
+  if (!running && extras?.usage) params.usage = extras.usage;
+  if (!running && typeof extras?.turnMs === "number") params.turnMs = extras.turnMs;
   const results = await Promise.allSettled(
     server
       .sessionAliases(acpSid)
-      .map((sid) => targetCx.notify("$/zcode/turnState", { sessionId: sid, running })),
+      .flatMap((sid) =>
+        TURN_STATE_METHODS.map((method) =>
+          targetCx.notify(method, { ...params, sessionId: sid }),
+        ),
+      ),
   );
   for (const r of results) {
     if (r.status === "rejected") {

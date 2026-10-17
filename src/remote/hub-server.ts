@@ -51,7 +51,7 @@ import { EventEmitter } from "node:events";
 import net from "node:net";
 import path from "node:path";
 import process from "node:process";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 
@@ -60,29 +60,41 @@ import { WebSocket, WebSocketServer, type RawData } from "ws";
 import { resolveRuntime, runtimeSpawnParts } from "../runtime.js";
 import { sessionTabTitle } from "../terminal-title.js";
 import { AGENT_INFO, compareVersions, log, warn } from "../utils.js";
-import type { TerminalPrefs } from "../config/user-config.js";
+import { expandHomePath, type TerminalPrefs } from "../config/user-config.js";
 import { tuiStatsSegments } from "../config/settings.js";
 import { readCodeFingerprint } from "./code-fingerprint.js";
-import { remoteEnabledLive, remoteTerminalPrefs } from "./config.js";
+import { remoteEnabledLive, remoteProjectRoots, remoteTerminalPrefs } from "./config.js";
 import { envWithLoginShell } from "./login-shell-env.js";
 import { accountUsageStats, type UsageStatsResult } from "../handlers/account.js";
 import { BOOT_RESUME_TRIGGER } from "../handlers/session.js";
 import { createSettingsHandler } from "./settings-endpoint.js";
 import {
   composeQuotaDock,
+  formatCpDockSegment,
   formatGoDockSegment,
   formatOcDockSegment,
   formatQuotaDock,
 } from "../quota/format.js";
+import { queryCpUsage } from "../quota/cliproxy/index.js";
 import { queryQuota } from "../quota/index.js";
 import { queryOcUsage } from "../quota/ollama-cloud/index.js";
 import { queryGoUsage } from "../quota/opencode-go/index.js";
-import { listKnownWorkspaces } from "../tasks-index.js";
+import { isTaskDeleted, listKnownWorkspaces, softDeleteWorkspaceTasks } from "../tasks-index.js";
+import { buildWorkflowOverview } from "./workflow-overview.js";
+import { collectSystemStats } from "./system-stats.js";
 
 export interface HubOptions {
   port: number;
   host: string;
   token: string;
+  /**
+   * Absolute path of a web-client build (`dist/`) to serve same-origin: after
+   * every existing route, GET/HEAD paths resolve inside this tree (`/` →
+   * index.html; content-hashed `assets/` are immutable). Unset — or a
+   * missing/unreadable dir at startup (one warning, silent degradation) —
+   * disables the mount; static hits never extend the hub's idle lifetime.
+   */
+  webDir?: string;
   /** Registration TTL before an instance is pruned (default 30s). */
   heartbeatTimeoutMs?: number;
   /**
@@ -210,6 +222,8 @@ interface InstanceEntry {
 const HEARTBEAT_TIMEOUT_MS = 30_000;
 const IDLE_EXIT_MS = 10 * 60_000;
 const PING_INTERVAL_MS = 30_000;
+/** Max subdirectory names per GET /api/fs/list before truncation. */
+const FS_LIST_LIMIT = 2000;
 /**
  * Per-instance TCP probe timeout for /api/instances?probe=1. Generous on
  * purpose: the bridge is single-threaded and a busy event loop (large payload
@@ -243,7 +257,9 @@ function authorized(req: IncomingMessage, url: URL, token: string): boolean {
 }
 
 function setCors(res: ServerResponse): void {
-  // The web UI is deployed as a separate origin; the token is the boundary.
+  // The web UI is deployed either as a separate origin (Netlify/Cloudflare
+  // Pages) or same-origin from the hub's own static mount (remote.webDir);
+  // the token is the boundary in both shapes.
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
@@ -279,6 +295,125 @@ function canonicalPath(p: string): string {
   } catch {
     return p;
   }
+}
+
+/**
+ * Canonical spellings of the configured remote.projectRoots (config file >
+ * env, LIVE read per call — same convention as remoteEnabledLive). These
+ * widen the session-create whitelist beyond the known-project list to any
+ * subdirectory under a root, powering the mobile app's browse-and-create
+ * flow. Empty when unconfigured: the known list alone stays the whitelist.
+ */
+function projectRootsRealpaths(): string[] {
+  return remoteProjectRoots().map(canonicalPath);
+}
+
+/** Whether the canonical path c is at or under one of the canonical roots. */
+function underAnyRoot(c: string, roots: string[]): boolean {
+  return roots.some((r) => c === r || c.startsWith(r + path.sep));
+}
+
+/**
+ * Whether a freshly-picked directory may host a NEW session: an existing
+ * directory that is not the filesystem root. Deliberately NARROWER than
+ * the known-list's isSelectableWorkspace exclusions — those temp/config-home
+ * rules guard AUTO-discovered historical cwds, while the paths reaching here
+ * sit under a root the user configured explicitly and are taken at face
+ * value.
+ */
+function isStartableDir(p: string): boolean {
+  if (canonicalPath(p) === path.sep) return false;
+  try {
+    return statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** Minimal closed MIME set for the web client's build output (spec §5). */
+const STATIC_MIME: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".ico": "image/x-icon",
+  ".woff2": "font/woff2",
+  ".json": "application/json; charset=utf-8",
+  ".txt": "text/plain; charset=utf-8",
+  ".map": "application/json; charset=utf-8",
+  ".webmanifest": "application/manifest+json; charset=utf-8",
+};
+
+/**
+ * Resolve the webDir to a canonical serving root, or null (one warning) when
+ * it is missing/unreadable — the hub keeps serving its API either way.
+ */
+function resolveWebRoot(webDir: string): string | null {
+  try {
+    const real = realpathSync(webDir);
+    if (!statSync(real).isDirectory()) throw new Error("not a directory");
+    return real;
+  } catch (e) {
+    warn(
+      `hub: webDir ${webDir} unusable (${e instanceof Error ? e.message : String(e)}) — ` +
+        "static hosting disabled, API unaffected",
+    );
+    return null;
+  }
+}
+
+/**
+ * Serve one GET/HEAD path from the static root. Returns false (nothing
+ * written) for anything that is not a real file inside the root — the
+ * caller's terminal 404 then applies. Traversal defenses are layered: the
+ * URL parser neutralizes literal dot segments, decode + normalize + prefix
+ * check catches the encoded `%2e%2e%2f` spellings, and a realpath re-check
+ * pins the FINAL target inside the root so symlinked files cannot escape.
+ */
+async function serveStatic(
+  root: string,
+  pathname: string,
+  method: string,
+  res: ServerResponse,
+): Promise<boolean> {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    return false; // malformed percent-encoding
+  }
+  if (decoded.includes("\0")) return false;
+  if (decoded === "/") decoded = "/index.html";
+  const target = path.normalize(path.join(root, `.${decoded}`));
+  if (target !== root && !target.startsWith(root + path.sep)) return false;
+  let real: string;
+  try {
+    real = realpathSync(target);
+  } catch {
+    return false;
+  }
+  if (real !== root && !real.startsWith(root + path.sep)) return false;
+  let body: Buffer;
+  try {
+    const st = await stat(real);
+    if (!st.isFile()) return false;
+    body = await readFile(real);
+  } catch {
+    return false; // vanished, or a stat race mid-build
+  }
+  const cacheControl = real.startsWith(root + path.sep + "assets" + path.sep)
+    ? "public, max-age=31536000, immutable"
+    : "no-cache";
+  res.writeHead(200, {
+    "Content-Type": STATIC_MIME[path.extname(real).toLowerCase()] ?? "application/octet-stream",
+    "Content-Length": body.length,
+    "Cache-Control": cacheControl,
+    "X-Content-Type-Options": "nosniff",
+  });
+  res.end(method === "HEAD" ? undefined : body);
+  return true;
 }
 
 function validSessions(raw: unknown): SessionSummary[] | null {
@@ -361,9 +496,10 @@ export type TerminalLaunch =
   /** Ghostty: `-e` trips its "Allow Ghostty to Execute" security prompt on
    * EVERY launch (GHSA-q9fg-cpmh-c78x — upstream refuses a disable switch),
    * so the hub drives its AppleScript dictionary instead (Ghostty ≥1.3.0):
-   * a `new tab` in the front window reuses an existing window, and `command`
-   * on a surface configuration runs the script without the prompt. Only a
-   * one-time macOS Automation (TCC) grant for the hub is required. */
+   * a `new tab` in the front window reuses an existing window, and
+   * `initial input` types the script into the default shell without the
+   * prompt. Only a one-time macOS Automation (TCC) grant for the hub is
+   * required. */
   | { kind: "ghosttyScript"; app: string }
   /** Warp: refuses `.command` files and its CLI is agent-only, but its URI
    * scheme EXECUTES a script handed to action/new_tab's path param
@@ -518,11 +654,22 @@ function appleScriptString(s: string): string {
 /**
  * The AppleScript source that opens the TUI script as a NEW TAB in Ghostty's
  * front window (a new window only when none exists). See the ghosttyScript
- * launcher: `command` on a surface configuration is Ghostty's trusted,
- * prompt-free path to run a program — unlike `-e`, which trips its
- * "Allow Ghostty to Execute" security gate on every launch.
+ * launcher: surface configuration `initial working directory` starts the tab's
+ * shell IN the project (a bare new tab inherits Ghostty's default cwd — the
+ * in-script `cd` only moves the child `sh`, so the terminal itself — prompt,
+ * OSC 7, later tabs' inherited cwd — would sit at `~`), and `initial input`
+ * then types "/bin/sh <script>; exit" into it — prompt-free, unlike `-e`
+ * ("Allow Ghostty to Execute" gate), and auto-closing: a `command` surface
+ * force-enables wait-after-command ONE-WAY (libghostty embedded.zig; ghostty
+ * discussion #13167), so after the CLI tree exits the tab would sit on "Press
+ * any key to close" forever and windows would pile up. `; exit` mirrors
+ * Ghostty's own open-a-script path (AppDelegate): the shell exits with the
+ * tree and the surface then closes itself.
  */
-export function ghosttyTabAppleScript(app: string, scriptPath: string): string {
+export function ghosttyTabAppleScript(app: string, scriptPath: string, cwd: string): string {
+  // Typed into the tab's default shell: single-quoted for the shell, then
+  // escaped for the AppleScript literal.
+  const typedInput = `/bin/sh ${shQuote(scriptPath)}; exit`;
   return [
     `tell application ${appleScriptString(app)}`,
     // activate requires live GUI-session focus — while the screen is LOCKED it
@@ -538,7 +685,8 @@ export function ghosttyTabAppleScript(app: string, scriptPath: string): string {
     "set tgt to front window",
     "end if",
     "set cfg to new surface configuration",
-    `set command of cfg to "/bin/sh " & ${appleScriptString(scriptPath)}`,
+    `set initial working directory of cfg to ${appleScriptString(cwd)}`,
+    `set initial input of cfg to ${appleScriptString(typedInput)} & linefeed`,
     "new tab in tgt with configuration cfg",
     "end tell",
   ].join("\n");
@@ -610,7 +758,7 @@ async function spawnTerminalTui(opts: {
   } else if (launch.kind === "ghosttyScript") {
     // osascript talks to the running app — a non-zero exit (pre-1.3 Ghostty,
     // denied Automation permission) falls through to the headless bridge.
-    argv = ["osascript", "-e", ghosttyTabAppleScript(launch.app, script)];
+    argv = ["osascript", "-e", ghosttyTabAppleScript(launch.app, script, opts.cwd)];
   } else if (launch.kind === "warpUri") {
     // new_tab = Warp's default open mode (like Cmd+T: a tab in the focused
     // window; Warp opens a window first if none exists).
@@ -765,8 +913,11 @@ function getQuotaDock(): Promise<{ formatted: string | null; fetchedAt: number }
     queryOcUsage()
       .then(formatOcDockSegment)
       .catch(() => null),
-  ]).then(([glm, go, oc]) => {
-    dockCache = { formatted: composeQuotaDock(glm, go, oc), at: Date.now() };
+    queryCpUsage()
+      .then((cp) => formatCpDockSegment(cp.result))
+      .catch(() => null),
+  ]).then(([glm, go, oc, cp]) => {
+    dockCache = { formatted: composeQuotaDock(glm, go, oc, cp), at: Date.now() };
     return { formatted: dockCache.formatted, fetchedAt: dockCache.at };
   });
 }
@@ -981,6 +1132,7 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     port,
     host,
     token,
+    webDir,
     heartbeatTimeoutMs = HEARTBEAT_TIMEOUT_MS,
     probeGraceMs = PROBE_GRACE_MS,
     idleExitMs = IDLE_EXIT_MS,
@@ -1006,6 +1158,14 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
    */
   const hubFingerprint =
     options.hubFingerprint !== undefined ? options.hubFingerprint : readCodeFingerprint();
+
+  /**
+   * Canonical web-client root (realpath'd webDir) or null when static
+   * hosting is off/unusable. Frozen at startup on purpose: the tree is a
+   * build output; per-request re-resolution buys nothing and a mid-run
+   * disappearance must serve 404s, not warnings.
+   */
+  const webRoot = webDir ? resolveWebRoot(webDir) : null;
 
   const instances = new Map<string, InstanceEntry>();
   const proxyPairs = new Set<{ client: WebSocket; bridge: WebSocket }>();
@@ -1586,6 +1746,26 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       res.end(JSON.stringify(list));
       return;
     }
+    // GET /api/workflow-overview — the machine-level workflow page payload
+    // (see workflow-overview.ts): one group per WORKSPACE (not per bridge —
+    // a project with an editor + serve bridge must not render twice) plus the
+    // machine-wide active-run list (the journal is shared; a client attached
+    // to one instance must still see another project's flying runs).
+    if (url.pathname === "/api/workflow-overview" && req.method === "GET") {
+      if (!authorized(req, url, token)) {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("unauthorized");
+        return;
+      }
+      const overview = await buildWorkflowOverview(Array.from(instances.values()));
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        // Live data — the hub holds no cache; clients must not either.
+        "Cache-Control": "no-store",
+      });
+      res.end(JSON.stringify(overview));
+      return;
+    }
     if (url.pathname === "/api/quota" && req.method === "GET") {
       if (!authorized(req, url, token)) {
         res.writeHead(401, { "Content-Type": "text/plain" });
@@ -1625,6 +1805,36 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       }
       return;
     }
+    // GET /api/system-stats — machine-level system status (host info, CPU,
+    // memory, storage, battery, power assertions, network, hub + bridge
+    // process resources) for the App's system-status page. Every field is
+    // independently best-effort (see system-stats.ts): rate fields need two
+    // polls ~1s apart to have a delta baseline. The hub-side 1s collect cache
+    // is the only caching layer.
+    if (url.pathname === "/api/system-stats" && req.method === "GET") {
+      if (!authorized(req, url, token)) {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("unauthorized");
+        return;
+      }
+      try {
+        const stats = await collectSystemStats(
+          Array.from(instances.values(), (e) => ({
+            id: e.id,
+            pid: e.pid,
+            workspace: e.workspace,
+          })),
+          { version: AGENT_INFO.version, instances: instances.size },
+        );
+        res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        res.end(JSON.stringify(stats));
+      } catch (err) {
+        warn(`hub: system-stats collect failed: ${String(err)}`);
+        res.writeHead(502, { "Content-Type": "text/plain" });
+        res.end("system stats failed");
+      }
+      return;
+    }
     // GET /api/projects — the machine's known-project list (remote
     // session-create, ADR-0014). Sourced from the App's tasks index: every
     // workspace that ever ran a session. The list gates POST /api/instances
@@ -1644,6 +1854,106 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
         "Cache-Control": "no-store",
       });
       res.end(JSON.stringify(projects));
+      return;
+    }
+    // GET /api/fs/list?path=<abs> — one directory level of the hub machine's
+    // filesystem, for the mobile app's browse-and-create flow. Read-only and
+    // deliberately unscoped (the token is the boundary, like every other hub
+    // route); the response's `creatable` flags whether a NEW session may
+    // start in the LISTED directory itself — a known project or under a
+    // configured remote.projectRoots root. Only subdirectories are listed:
+    // the flow picks a working directory, never a file.
+    if (url.pathname === "/api/fs/list" && req.method === "GET") {
+      if (!authorized(req, url, token)) {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("unauthorized");
+        return;
+      }
+      const rawPath = (url.searchParams.get("path") ?? "").trim();
+      const target = rawPath === "" || rawPath === "~" ? homedir() : expandHomePath(rawPath);
+      if (!path.isAbsolute(target)) {
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        res.end("absolute path required");
+        return;
+      }
+      let real: string;
+      try {
+        real = realpathSync(target);
+        if (!(await stat(real)).isDirectory()) throw new Error("not a directory");
+      } catch {
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("directory not found");
+        return;
+      }
+      let dirents: Dirent[];
+      try {
+        dirents = await readdir(real, { withFileTypes: true });
+      } catch {
+        dirents = []; // unreadable dir (EACCES) — an empty listing, not an error
+      }
+      const names: string[] = [];
+      let truncated = false;
+      for (const d of dirents) {
+        if (names.length >= FS_LIST_LIMIT) {
+          truncated = true;
+          break;
+        }
+        let isDir = d.isDirectory();
+        if (!isDir && d.isSymbolicLink()) {
+          // Follow symlinks with stat: a linked-in directory is a navigable
+          // workspace candidate; a broken link simply drops out.
+          try {
+            isDir = statSync(path.join(real, d.name)).isDirectory();
+          } catch {
+            isDir = false;
+          }
+        }
+        if (isDir) names.push(d.name);
+      }
+      names.sort((a, b) => a.localeCompare(b));
+      const known = await listKnownWorkspaces(projectsDbPath);
+      const knownPaths = new Set(known.map((p) => canonicalPath(p.workspacePath)));
+      const creatable =
+        knownPaths.has(real) ||
+        (isStartableDir(real) && underAnyRoot(real, projectRootsRealpaths()));
+      const parent = path.dirname(real);
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(
+        JSON.stringify({
+          path: real,
+          parent: parent === real ? null : parent,
+          creatable,
+          entries: names.map((name) => ({ name })),
+          truncated,
+        }),
+      );
+      return;
+    }
+    // POST /api/projects/delete — soft-delete a project (tombstones, not a
+    // purge): every tasks row of the workspace gets deleted=1, so the project
+    // vanishes from GET /api/projects and POST /api/instances above (unknown
+    // project), its sessions from every listing, and the desktop App's
+    // sidebar too (same index). The backend store keeps all conversation
+    // bytes; a NEW session in that project re-adds a fresh row and the
+    // project reappears — a hide, not a ban. Idempotent: 0 rows flipped is
+    // still ok (already deleted / never known).
+    if (url.pathname === "/api/projects/delete" && req.method === "POST") {
+      if (!authorized(req, url, token)) {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("unauthorized");
+        return;
+      }
+      const body = await readJson(req);
+      const rawPath = (body as { workspacePath?: unknown } | undefined)?.workspacePath;
+      const workspacePath = typeof rawPath === "string" ? rawPath.trim() : "";
+      if (!workspacePath) {
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        res.end("workspacePath required");
+        return;
+      }
+      const deletedTasks = await softDeleteWorkspaceTasks(workspacePath, projectsDbPath);
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ ok: true, deletedTasks }));
       return;
     }
     // GET /api/projects/sessions?workspacePath=… — the project's backend
@@ -1774,9 +2084,27 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
         return;
       }
       const known = await listKnownWorkspaces(projectsDbPath);
-      if (!known.some((p) => p.workspacePath === workspacePath)) {
+      // The known-project list is the default whitelist; the configured
+      // remote.projectRoots widen it to any existing subdirectory under a
+      // root (the mobile app's browse-and-create flow). Same convenience-
+      // bound caveat as GET /api/projects: the trust boundary is the token,
+      // this gate only keeps fat-fingered paths out.
+      const roots = projectRootsRealpaths();
+      const allowed =
+        known.some((p) => p.workspacePath === workspacePath) ||
+        (isStartableDir(workspacePath) && underAnyRoot(canonicalPath(workspacePath), roots));
+      if (!allowed) {
         res.writeHead(403, { "Content-Type": "text/plain" });
         res.end("unknown project");
+        return;
+      }
+      // A tombstoned session is not resumable: the listing never offers it,
+      // so an id arriving here comes from a stale client cache. Refusing
+      // keeps the delete sticky; a BOGUS id still gets its honest window
+      // (unknown ≠ deleted — isTaskDeleted is false without a row).
+      if (resumeSid && (await isTaskDeleted(resumeSid, projectsDbPath))) {
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("session deleted");
         return;
       }
       if (resumeSid) {
@@ -2046,13 +2374,14 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       res.end(JSON.stringify({ ok: true }));
       return;
     }
-    // POST /api/instances/{id}/sessions/{sid}/close|rename — the remote HTTP
-    // write surface (ADR-0006): forward-and-relay to the bridge's loopback
-    // route. The hub still routes by instance id only; semantics (running
-    // guard / discovery retirement, title validation + pinning + broadcast)
-    // stay in the bridge. Any request body pipes through untouched.
+    // POST /api/instances/{id}/sessions/{sid}/close|rename|delete — the
+    // remote HTTP write surface (ADR-0006): forward-and-relay to the bridge's
+    // loopback route. The hub still routes by instance id only; semantics
+    // (running guard / discovery retirement, title validation + pinning +
+    // broadcast, delete tombstoning + live refusal) stay in the bridge. Any
+    // request body pipes through untouched.
     const sessionOpMatch = url.pathname.match(
-      /^\/api\/instances\/([^/]+)\/sessions\/([^/]+)\/(close|rename)$/,
+      /^\/api\/instances\/([^/]+)\/sessions\/([^/]+)\/(close|rename|delete)$/,
     );
     if (sessionOpMatch && req.method === "POST") {
       const [, instId, sid, op] = sessionOpMatch;
@@ -2098,6 +2427,53 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       });
       // Relay any request body through (close sends none, rename carries the
       // JSON title — chunked, since the hub does not forward headers).
+      req.pipe(upstream);
+      return;
+    }
+    // POST /api/instances/{id}/push/test — the push-channel verification route
+    // (push-backend-requirements §7): strip the instance prefix, forward the
+    // /push/test suffix to the bridge's loopback endpoint. Same
+    // forward-and-relay shape as the session close/rename block above; the hub
+    // parses no body and holds no push state.
+    const pushMatch = url.pathname.match(/^\/api\/instances\/([^/]+)\/(push\/test)$/);
+    if (pushMatch && req.method === "POST") {
+      const [, instId, suffix] = pushMatch;
+      if (!authorized(req, url, token)) {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("unauthorized");
+        return;
+      }
+      const entry = instances.get(instId!);
+      if (!entry) {
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("unknown instance");
+        return;
+      }
+      const upstream = httpRequest(
+        {
+          host: "127.0.0.1",
+          port: entry.port,
+          path: `/${suffix}`,
+          method: "POST",
+        },
+        (up) => {
+          const headers = { ...up.headers };
+          delete headers["transfer-encoding"];
+          delete headers.connection;
+          res.writeHead(up.statusCode ?? 502, headers);
+          up.pipe(res);
+        },
+      );
+      upstream.on("error", () => {
+        if (res.headersSent) res.destroy();
+        else {
+          res.writeHead(502, { "Content-Type": "text/plain" });
+          res.end("bridge unreachable");
+        }
+      });
+      res.on("close", () => {
+        if (!res.writableEnded) upstream.destroy();
+      });
       req.pipe(upstream);
       return;
     }
@@ -2192,6 +2568,14 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
         log("hub: newer-bridge vote ignored (restart cooldown after a recent restart)");
       }
       return;
+    }
+    // Same-origin web client (opt-in webDir): mounted AFTER every existing
+    // route, so API/WS precedence is untouched. Unauthenticated by design —
+    // public frontend bytes; the bearer token remains the /api/* boundary.
+    // Static hits deliberately never touch idleSince: a configured webDir
+    // must not by itself keep the idle-retire clock from firing.
+    if (webRoot !== null && (req.method === "GET" || req.method === "HEAD")) {
+      if (await serveStatic(webRoot, url.pathname, req.method ?? "GET", res)) return;
     }
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("not found");

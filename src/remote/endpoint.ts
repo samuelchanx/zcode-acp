@@ -32,6 +32,8 @@ import { AGENT_INFO, log, warn } from "../utils.js";
 import { createFileHandler } from "./file-endpoint.js";
 import { envWithLoginShell } from "./login-shell-env.js";
 import { createSessionCloseHandler } from "./session-close-endpoint.js";
+import { createSessionDeleteHandler } from "./session-delete-endpoint.js";
+import { createPushTestHandler } from "./push-test-endpoint.js";
 import { createSessionListHandler } from "./session-list-endpoint.js";
 import { createSessionRenameHandler } from "./session-rename-endpoint.js";
 import { createSettingsHandler } from "./settings-endpoint.js";
@@ -236,21 +238,26 @@ export async function startRemoteEndpoint(
   const statusHandler = createStatusHandler(server);
   const settingsHandler = createSettingsHandler(server);
   const sessionCloseHandler = createSessionCloseHandler(server);
+  const pushTestHandler = createPushTestHandler(server);
   const sessionRenameHandler = createSessionRenameHandler(server);
+  const sessionDeleteHandler = createSessionDeleteHandler(server);
   const sessionListHandler = createSessionListHandler(server);
 
   const httpServer = createServer((req, res) => {
     const path = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
     const closeMatch = path.match(/^\/sessions\/([^/]+)\/close$/);
     const renameMatch = path.match(/^\/sessions\/([^/]+)\/rename$/);
+    const deleteMatch = path.match(/^\/sessions\/([^/]+)\/delete$/);
     // Settings lives under a prefix so the routes above stay unambiguous, and
     // so the hub can strip the same prefix when it re-serves them (ADR-0025).
     if (path === "/acp") acpHttpHandler(req, res);
     else if (path.startsWith("/settings")) settingsHandler(req, res);
+    else if (path === "/push/test") pushTestHandler(req, res);
     else if (path.startsWith("/fs/")) fileHandler(req, res);
     else if (path === "/status") statusHandler(req, res);
     else if (closeMatch) sessionCloseHandler(req, res, closeMatch[1]!);
     else if (renameMatch) sessionRenameHandler(req, res, renameMatch[1]!);
+    else if (deleteMatch) sessionDeleteHandler(req, res, deleteMatch[1]!);
     else if (path === "/sessions") sessionListHandler(req, res);
     else {
       res.writeHead(404, { "Content-Type": "text/plain" });

@@ -53,10 +53,13 @@ ACP editor ────── stdio ──────────┘
 | `GET /api/instances/{id}/status`                       | required | Real-time per-session running status of one bridge.                                                                                                               |
 | `POST /api/instances/{id}/sessions/{sessionId}/close`  | required | Retire a session from remote discovery — see [Closing a session](#closing-a-session).                                                                             |
 | `POST /api/instances/{id}/sessions/{sessionId}/rename` | required | Rename a session — see [Renaming a session](#renaming-a-session).                                                                                                 |
+| `POST /api/instances/{id}/sessions/{sessionId}/delete` | required | Soft-delete (hide) a session from every listing — see [Deleting a project or session](#deleting-a-project-or-session).                                            |
 | `GET /api/quota`                                       | required | Account-level usage stats — same payload as `account/usage_stats`, no ACP connection needed.                                                                      |
 | `POST /api/upgrade`                                    | required | Trigger the hub's own staleness check — see [Hub self-upgrade](#hub-self-upgrade).                                                                                |
 | `GET /api/projects`                                    | required | Known-project list (remote session-create whitelist) — see below.                                                                                                 |
+| `GET /api/fs/list?path=`                               | required | One directory level for the browse-and-create flow — see [Starting a session in a new directory](#starting-a-session-in-a-new-directory).                         |
 | `GET /api/projects/sessions?workspacePath=`            | required | A project's full session store incl. closed ones — see [Resuming a closed session](#resuming-a-closed-session).                                                   |
+| `POST /api/projects/delete {workspacePath}`            | required | Soft-delete a project and all its sessions (hidden from every listing) — see [Deleting a project or session](#deleting-a-project-or-session).                     |
 | `POST /api/instances {workspacePath[, sessionId]}`     | required | Create a bridge for one known project — a visible terminal TUI window (session-create) or one that boots into a closed session (resume, `sessionId`) — see below. |
 
 HTTP auth: `Authorization: Bearer <token>` or `?token=<token>`.
@@ -175,6 +178,14 @@ POST {hub}/api/instances  body {"workspacePath":"/Users/me/proj"}
   bound, not a security boundary: a token holder can already run any
   editor-bridge session in an arbitrary cwd; the trust boundary is the
   token itself.
+- **`remote.projectRoots` widening** (bridge ≥0.65, browse-and-create): the
+  machine's user config may list absolute directory roots
+  (`"remote": {"projectRoots": ["~/Develop"]}`, `~` expanded, read live;
+  env fallback `ZCODE_ACP_PROJECT_ROOTS`, a `:`-separated path-list). The
+  POST then also accepts any existing subdirectory under a configured
+  root, not just known projects. Unconfigured, the known list alone stays
+  the whitelist. See [Starting a session in a new
+  directory](#starting-a-session-in-a-new-directory).
 - On create the hub incubates a VISIBLE interactive TUI (Martty) in the machine's
   terminal (ADR-0016, macOS): the project's owner gets a real local CLI
   window, and its bridge registers with the hub like any serve instance (it
@@ -190,12 +201,12 @@ POST {hub}/api/instances  body {"workspacePath":"/Users/me/proj"}
   `ZCODE_ACP_HUB_TERMINAL_COMMAND` (a shell command; `{script}` is replaced
   by the quoted script path) wins over `ZCODE_ACP_HUB_TERMINAL_APP`, which
   is matched against built-in launch recipes: Terminal and iTerm run the
-  script via `open -a` (both execute `.command`); WezTerm, kitty, Alacritty,
-  and Ghostty are driven by their own CLI (`open -na <app> --args … -e …`);
-  any other name passes through to `open -a` as-is. Default: Terminal.app.
-  Warp cannot execute scripts or commands programmatically at all
-  (warpdotdev/warp#1917, #3959, #9083) — naming it warns, and the flow
-  degrades to the headless bridge after the register timeout.
+  script via `open -a` (both execute `.command`); WezTerm, kitty, and
+  Alacritty are driven by their own CLI (`open -na <app> --args … -e …`);
+  Ghostty opens an AppleScript tab in the project directory that types the
+  script into the default shell (auto-closes when the CLI exits); Warp opens its
+  `warp://action/new_tab?path=…` URI. Any other name passes through to
+  `open -a` as-is. Default: Terminal.app.
 - Create NEVER reuses a live serve-origin instance (ADR-0016 amendment):
   the App flow lists project history first, which incubates a headless serve
   bridge, and reuse meant the promised terminal window could never open once
@@ -209,6 +220,42 @@ POST {hub}/api/instances  body {"workspacePath":"/Users/me/proj"}
   demand); the headless fallback exists for remote interest only and exits
   ~10 minutes after the last client detaches AND the last running turn
   finishes. Treat any vanished instance like a dead bridge.
+
+## Starting a session in a new directory
+
+The known-project list only ever holds directories that already ran a
+session. To start one somewhere new, browse the machine's directory tree
+(bridge ≥0.65) and create in the picked directory — it must sit under a
+configured `remote.projectRoots` root (see above):
+
+```text
+GET {hub}/api/fs/list?path=/Users/me          (path optional — default: home)
+  → 200 {"path":"/Users/me","parent":"/Users",
+         "creatable":false,
+         "entries":[{"name":"Develop"},{"name":"Documents"}, …],
+         "truncated":false}
+  → 400 "absolute path required"   (relative path)
+  → 404 "directory not found"      (missing path, or a file)
+
+POST {hub}/api/instances  body {"workspacePath":"/Users/me/Develop/newproj"}
+  → 200 {"id":"47073","reused":false}   (exactly the known-project create flow)
+```
+
+- One directory level per call; walk down via `entries[].name`, up via
+  `parent` (null at `/`). `path` in the answer is the RESOLVED (realpath)
+  spelling — navigate by it, not by what you sent (symlinks).
+- Only subdirectories are listed (cap 2000; `truncated` flags the cut);
+  hidden (`.`-prefixed) entries ARE included — filter client-side if the
+  UI wants them gone.
+- `creatable` tells whether a NEW session may start in the LISTED
+  directory itself: a known project, or under a configured project root.
+  With no roots configured everything still browses, but `creatable` is
+  true only on known projects. A create that ignores it gets the normal
+  403 "unknown project".
+- The create itself is the ordinary session-create flow above (visible
+  terminal TUI on the machine, ~20s budget). After the first session runs,
+  the directory enters the tasks index and appears in `GET /api/projects`
+  like any known project.
 
 ## Resuming a closed session
 
@@ -372,9 +419,15 @@ section — so clients can reproduce the CLI layout exactly:
       "ollama": {
         "kind": "success",
         "windows": [
-          { "key": "session", "label": "5h", "usagePercent": 31 },
-          { "key": "weekly", "label": "Week", "usagePercent": 67.5 }
-        ]
+          { "key": "monthly", "label": "Month", "usagePercent": 2.6,
+            "resetsAt": 1729071480308 }
+        ],
+        "usage": {
+          "plan": "pro", "usageUsd": 1.5747, "creditUsd": 60,
+          "requestCount": 246, "inputTokens": 14294081,
+          "cachedInputTokens": 12922504, "outputTokens": 940919,
+          "window": "30d"
+        }
       }
     } }
 ```
@@ -391,12 +444,14 @@ section — so clients can reproduce the CLI layout exactly:
   means the user never set OpenCode Go credentials — omit the section, like
   the CLI does.
 - `ollama` (`kind`: `success` | `not_configured` | `auth_error` |
-  `unavailable`): on success, `windows` carries whichever entries the
-  account's plan exposes — legacy plans: `session` (`5h`) + `weekly`
-  (`Week`); current credit plans: `monthly` (`Month`) — each with
-  `usagePercent` (0–100) and, when available, `resetsAt` (epoch ms,
-  derived client-side: epoch-aligned 5h buckets / Monday 00:00 UTC weeks /
-  the `/api/me` billing period or subscription-day anniversary for monthly).
+  `unavailable`): since the 2026-10 upstream API rewrite the endpoint reports
+  spend only, so on success `windows` carries the derived `monthly` (`Month`)
+  entry — 30d `usageUsd` ÷ the plan's monthly credit, absent when the plan's
+  credit is unknown — with `resetsAt` (epoch ms, from the `/api/me` billing
+  period or subscription-day anniversary) when available. The additive
+  `usage` object carries the raw analytics (`plan`, `usageUsd`,
+  `creditUsd?`, `requestCount`/token totals, `window: "30d"`) for clients
+  that want to render spend directly; older clients ignore it.
   `not_configured` means no
   Ollama API key is set — omit the section, like the CLI does.
 - Provider failures are per-section `kind` strings, not JSON-RPC errors —
@@ -802,6 +857,52 @@ Errors: `400` missing/empty title or oversized body (>4 KB), `401` bad token,
 `404` unknown session (or instance), `502` bridge unreachable. Renaming during
 a running turn is allowed — titles are no longer turn-coupled.
 
+## Deleting a project or session
+
+```text
+POST {hub}/api/projects/delete
+     body: { "workspacePath": "/Users/me/proj" }          → 200 { "ok": true, "deletedTasks": 12 }
+
+POST {hub}/api/instances/{id}/sessions/{sessionId}/delete → 200 { "ok": true, "deleted": true }
+```
+
+Both are **soft deletes** (tombstones), matching the ZCode App's own delete
+semantics: the tasks-index rows get `deleted=1`, every listing hides them, and
+the backend's session store keeps the conversation bytes — nothing is purged,
+and a delete is reversible by clearing the flag (no undelete API yet).
+
+What hides, from where:
+
+- **Project delete** flips every tasks row of the workspace. The project
+  vanishes from `GET /api/projects`, `POST /api/instances` then refuses it
+  (`403 unknown project`), and all its sessions disappear from every listing.
+- **Session delete** tombstones one row (creating a minimal one for sessions
+  that predate tasks-index sync). The session disappears from
+  `GET /api/projects/sessions`, from ACP `session/list`, and from the CLI
+  `/resume` picker. The desktop App's sidebar reads the same index — deleted
+  items hide there too (machine-wide consistency).
+- Sessions **archived** in the desktop App (`archived=1`) are hidden from the
+  same listings — the remote default list mirrors the App's default list.
+
+Deletes are also **self-healing** — a hide, not a ban: opening the project
+anywhere (the CLI/editor `/resume` picker itself, or a new tab in it) revives
+a FULLY deleted project's conversations in the same listing, and a tombstoned
+session that is used again (loaded with history, resumed, or prompted through
+any CLI/editor tab) has its tombstone cancelled. Individually deleted sessions
+of a project that still
+has visible conversations stay deleted, and desktop-archived rows are never
+revived (archive is the App's own marker). Resuming a tombstoned session id
+via `POST /api/instances` still answers `404 session deleted` — a stale
+client cannot resurrect anything; only real bridge-side usage does. Deleting
+does not stop anything else either: live or running conversations are refused
+with `409` (stop or close them first).
+
+Errors: `400` missing `workspacePath` or malformed session id, `401` bad
+token, `404` unknown instance / deleted-on-resume, `409` session is live on
+this bridge, `502` bridge unreachable, `503` tasks index unavailable
+(session delete only — never a silent success). Project delete is idempotent:
+an unknown or already-deleted project answers `200` with `deletedTasks: 0`.
+
 ## Hub self-upgrade
 
 ```text
@@ -810,11 +911,16 @@ POST {hub}/api/upgrade   → 200 { "ok": true, "restarting": false, "reason": "u
 ```
 
 Lets a remote client pick up a hub that was rebuilt on the machine (e.g. code
-edited and `pnpm build` run through a remote agent session). The client only
-**triggers** the check — the restart decision is entirely the hub's own. The
-hub restarts onto the on-disk code only when it judges that code NEWER than
-itself, by either signal:
+edited and `pnpm build` run through a remote agent session). A local rebuild
+needs no manual call — `pnpm build`'s last step runs `hub-upgrade-notify`,
+which POSTs here with the configured token (the npm `postinstall` does the
+same for package consumers), so a rebuilt dist is picked up automatically.
+The client only **triggers** the check — the restart decision is entirely the
+hub's own. The hub restarts onto the on-disk code only when it judges that
+code NEWER than itself, by any of these signals:
 
+- the on-disk dist's content fingerprint differs from the one frozen into the
+  running process at start (the primary, release-independent signal), **or**
 - the on-disk `package.json` version is newer than the version frozen into
   the running process at start, **or**
 - any `.js` under `dist/` has an mtime later than process start (a rebuild,
@@ -828,6 +934,36 @@ mtime, so the condition self-negates — no restart loops, and an OLDER on-disk
 version never triggers anything.
 
 Errors: `401` bad token. `GET` (or any other method) falls through to `404`.
+
+## Workflow overview (machine-level)
+
+```text
+GET {hub}/api/workflow-overview   → 200 { ok: true, groups: [...], activeRuns: [...] }
+```
+
+The management page's single read (bridge 0.60.0+, served by the HUB, not
+proxied per instance): the hub aggregates every registered bridge into one
+GROUP per workspace (editor + serve bridges of one project render once,
+freshest-started bridge preferred, siblings as fallback) plus `activeRuns` —
+the machine-wide `pending`/`running` journal window, each row annotated with
+`ownerInstanceId` (the instance currently listing the row's session, so
+stop/detail address correctly from a client attached elsewhere). Per-read
+budget 8s, per-group best-effort: one dead bridge degrades only its own
+workspace to an `error` group.
+
+**Live correction for falsely-interrupted rows**: the dwf journal is shared
+by every backend process, and upstream's orphan reconciliation can write
+`stopped(interrupted)` onto a run that is still executing in ANOTHER process
+(it never flips back mid-run). For every served row carrying
+`stopReason: "interrupted"`, the hub probes the owner workspace's bridges'
+session-scoped live read (`/settings/workflow-runs?sessionId=`, joining by
+`runId`) and overrides the row with the live verdict — the SAME read
+covers stop/resume addressing. Note the parent session reads `idle` while its
+workflow flies, so "is the session running" is never a liveness test for a
+run; the runId join is. Server-internal module:
+`src/remote/workflow-overview.ts`.
+
+Errors: `401` bad token.
 
 ## Session files (read-only)
 
@@ -902,10 +1038,28 @@ everything below and you get the full replay):
       "replayedMessages": 47,
       "replayedTurns": 12,
       "totalMessages": 1893,
-      "totalTurns": 412
+      "totalTurns": 412,
+      "lastMessageId": "msg_b7c1…"
     }
   }
   ```
+
+  `lastMessageId` (additive) is the id of the newest message at or below the
+  slice's end anchor — on a `session/load` (tail or metadata-only) that is
+  history's newest message, on a `load_earlier` page the last message of the
+  page. It is the preferred reconcile key for a cached re-attach: a client
+  that watched a turn live has the new tail but a stale `totalMessages` (the
+  count only refreshes on replay), so comparing counts alone forces a
+  redundant full replay on every re-entry. Null on an empty store or an
+  id-less tail.
+
+  A metadata-only attach (`limit 0`) is deliberately FAST over complete: the
+  bridge skips the hydration settle for it, so on a freshly-resumed backend
+  the meta may describe a mid-hydration PREFIX (smaller `totalMessages`,
+  prefix-tail `lastMessageId`). Treat reconcile conservatively — a mismatch
+  is "unknown, re-attach with a real limit"; only an exact tail-id match
+  means "nothing changed". The follow-up full attach is where the settle
+  runs, so it always sees the complete history.
 
 - **`session/load_earlier`** (`{ sessionId, before, limit }`, limit defaults
   to 50) delivers one page of `session/update`s strictly older than `before`,

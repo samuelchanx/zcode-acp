@@ -22,11 +22,22 @@
 
 import { randomUUID } from "node:crypto";
 
-import { rememberGate, type WorkflowGate } from "../config/workflow-gate.js";
+import { userConfigPath } from "../config/user-config.js";
+import {
+  DYNAMIC_WORKFLOW_MODES,
+  type DynamicWorkflowMode,
+  ensureWorkflowPolicyPushed,
+  rememberGate,
+  workflowOverrideNow,
+  type WorkflowGate,
+} from "../config/workflow-gate.js";
 import { ensureRealSession } from "../handlers/session.js";
-import { lookupLazySession, rememberLazySession } from "../lazy-sessions.js";
+import { loadAliasesByZcodeSid, lookupLazySession, rememberLazySession } from "../lazy-sessions.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { log, warn } from "../utils.js";
+import { armWorkflowListWatch } from "../workflow/list-watch.js";
+import { writeJsonAtomic } from "./atomic-write.js";
+import { dismissedRunIds, dismissWorkflowRunIds } from "./workflow-run-dismissals.js";
 
 /** Workflow scope vocabulary (upstream workflows/* `scope`). */
 export type WorkflowScope = "project" | "global";
@@ -69,25 +80,86 @@ function messageOf(error: unknown): string {
 }
 
 /**
- * Await the per-backend gate verdict and refuse when the feature is off.
- * The upstream v4 start/resume commands are NOT gated by the backend policy
- * (port presence is their only gate), so the bridge guards itself — a
- * headless backend would otherwise happily run workflows the remote config
- * disabled. A null gate means NO backend was ever spawned (an App-only flow
- * that never chatted): spawn one — ensureBackend starts the gate fetch — and
- * await the fresh verdict, so a cold bridge reports the real answer instead
- * of a false 403. An actual fetch failure still settles disabled
- * (fail-closed, like the gate itself).
+ * Await the effective gate verdict and refuse when the feature is off. The
+ * local override (App settings toggle / env) short-circuits FIRST — no backend
+ * spawn, no network (upstream folds the override ahead of every network
+ * action), so a cold App-only bridge answers from the switch alone. An
+ * explicit override=disabled refuses with the same 403 shape — an upstream
+ * re-add of the flag cannot re-enable what the operator switched off. The
+ * upstream v4 start/resume commands are NOT gated by the backend policy (port
+ * presence is their only gate), so the bridge guards itself — a headless
+ * backend would otherwise happily run workflows the gate disabled. A null
+ * remote verdict means NO backend was ever spawned (an App-only flow that
+ * never chatted): spawn one — ensureBackend starts the gate fetch — and await
+ * the fresh verdict, so a cold bridge reports the real answer instead of a
+ * false 403. An actual fetch failure still settles disabled (fail-closed,
+ * like the gate itself). The 403 message carries mode+source so a client can
+ * tell "server pulled the flag" (disabled/default) from "the fetch is broken"
+ * (unknown/default) without probing /settings/all.
  */
 export async function requireWorkflowEnabled(server: ZcodeAcpServer): Promise<WorkflowGate> {
+  const override = workflowOverrideNow();
+  if (override) {
+    if (!override.enabled) {
+      throw new WorkflowApiError(
+        403,
+        "workflow_disabled",
+        `gate mode=${override.mode} source=override`,
+      );
+    }
+    ensureWorkflowPolicyPushed(server);
+    armWorkflowListWatch(server);
+    return override;
+  }
   if (!server.backendWorkflowGate) {
     await server.ensureBackend().catch((): undefined => undefined);
   }
   const promise = server.backendWorkflowGate;
   const gate = promise ? await promise : null;
   if (promise && gate) rememberGate(promise, gate);
-  if (!gate?.enabled) throw new WorkflowApiError(403, "workflow_disabled");
+  if (!gate?.enabled) {
+    throw new WorkflowApiError(
+      403,
+      "workflow_disabled",
+      `gate mode=${gate?.mode ?? "unknown"} source=${gate?.source ?? "default"}`,
+    );
+  }
+  armWorkflowListWatch(server);
   return gate;
+}
+
+/** Settings value for the gate switch: a concrete mode, or "auto" (follow remote). */
+export type WorkflowGateModeSetting = "auto" | DynamicWorkflowMode;
+
+/** The valid non-auto settings vocabulary, for route validation. */
+export const WORKFLOW_GATE_SETTINGS: readonly WorkflowGateModeSetting[] = [
+  "auto",
+  ...DYNAMIC_WORKFLOW_MODES,
+];
+
+/**
+ * Persist/clear the machine-level workflow gate override in the user config
+ * (`workflow.mode`): the App settings toggle's write half. "auto" DELETES the
+ * key (follow the remote verdict). Raw read-modify-write under the config
+ * lock — the file carries sections owned by other writers, which must survive
+ * byte-for-byte. The next gate read sees the change live (no bridge restart);
+ * existing sessions keep their toolset until re-created/resumed (upstream
+ * "affects only records created/resumed afterwards" semantics).
+ */
+export async function setWorkflowGateMode(mode: WorkflowGateModeSetting): Promise<void> {
+  await writeJsonAtomic(userConfigPath(), (current) => {
+    const next = { ...current };
+    const workflow = {
+      ...(typeof next["workflow"] === "object" && next["workflow"] !== null
+        ? (next["workflow"] as Record<string, unknown>)
+        : {}),
+    };
+    if (mode === "auto") delete workflow["mode"];
+    else workflow["mode"] = mode;
+    if (Object.keys(workflow).length > 0) next["workflow"] = workflow;
+    else delete next["workflow"];
+    return next;
+  });
 }
 
 /** Workspace ref for session-less `workflows/*` calls (collectSessions shape). */
@@ -241,7 +313,7 @@ export async function listRuns(
   opts: { scope?: WorkflowScope; name?: string; limit?: number } = {},
 ): Promise<Record<string, unknown>> {
   await requireWorkflowEnabled(server);
-  return rpc(
+  const result = await rpc(
     server,
     "workflows/runs",
     {
@@ -252,6 +324,110 @@ export async function listRuns(
     },
     TIMEOUT_FILE_MS,
   );
+  attachRunSessionAliases(server, result);
+  stripDismissedRuns(result);
+  return result;
+}
+
+/**
+ * Join each journal row's parentSessionId (the BACKEND session id) to an
+ * attachable ACP alias, so an editor-launched run is actionable from the app
+ * (open session / resume) — the app's own launch memory only covers runs IT
+ * started. In-memory mapping first (fresh, no disk), the durable alias store
+ * as the restart fallback; rows this bridge cannot resolve stay bare and the
+ * app keeps them read-only.
+ */
+function attachRunSessionAliases(server: ZcodeAcpServer, result: Record<string, unknown>): void {
+  const runs = result["runs"];
+  if (!Array.isArray(runs)) return;
+  let storeIndex: Map<string, string> | null = null;
+  for (const row of runs) {
+    if (row === null || typeof row !== "object") continue;
+    const parent = (row as { parentSessionId?: unknown }).parentSessionId;
+    if (typeof parent !== "string" || !parent) continue;
+    const acpSid =
+      server.resolveAcpSid(parent) ?? (storeIndex ??= loadAliasesByZcodeSid()).get(parent);
+    if (acpSid) (row as { acpSessionId?: string }).acpSessionId = acpSid;
+  }
+}
+
+/**
+ * Drop dismissed runs (bridge-side hide list, see workflow-run-dismissals)
+ * from a journal-shaped result in place. Dismissal exists because the journal
+ * has no delete RPC and is not ours to write — every list this bridge serves
+ * filters through here, so a hidden run is hidden consistently.
+ */
+function stripDismissedRuns(result: Record<string, unknown>): void {
+  const runs = result["runs"];
+  if (!Array.isArray(runs)) return;
+  const dismissed = dismissedRunIds();
+  if (dismissed.size === 0) return;
+  const kept = runs.filter((row) => {
+    if (row === null || typeof row !== "object") return true;
+    const id = (row as { runId?: unknown }).runId;
+    return !(typeof id === "string" && dismissed.has(id));
+  });
+  if (kept.length !== runs.length) result["runs"] = kept;
+}
+
+/** Per-session workflow activity joined onto the session-history listing. */
+export interface WorkflowActivity {
+  /** Journal runs of this session still pending/running in the newest window. */
+  active: number;
+  /** The newest run of the window (absent = no run recorded). */
+  last?: { status: string; updatedAt?: number; name?: string };
+}
+
+/**
+ * Group the journal's newest run window (50) by parentSessionId — the
+ * session-history rows' workflow badges. Silent degrade BY DESIGN: gate off,
+ * backend down, or a backend without the journal route all mean "no field",
+ * never a failed history page. A session whose latest run fell out of the
+ * window simply shows no badge — the same freshness cut the desktop's task
+ * row makes.
+ */
+export async function workflowActivityBySession(
+  server: ZcodeAcpServer,
+): Promise<Map<string, WorkflowActivity>> {
+  const out = new Map<string, WorkflowActivity>();
+  try {
+    await requireWorkflowEnabled(server);
+    const result = await rpc(
+      server,
+      "workflows/runs",
+      { workspace: workspaceRef(server), limit: 50 },
+      TIMEOUT_FILE_MS,
+    );
+    const runs = result["runs"];
+    if (!Array.isArray(runs)) return out;
+    const dismissed = dismissedRunIds();
+    for (const row of runs) {
+      if (row === null || typeof row !== "object") continue;
+      const rec = row as {
+        parentSessionId?: unknown;
+        status?: unknown;
+        updatedAt?: unknown;
+        name?: unknown;
+        runId?: unknown;
+      };
+      if (typeof rec.runId === "string" && dismissed.has(rec.runId)) continue;
+      if (typeof rec.parentSessionId !== "string" || !rec.parentSessionId) continue;
+      const act = out.get(rec.parentSessionId) ?? { active: 0 };
+      if (rec.status === "running" || rec.status === "pending") act.active += 1;
+      const updated = typeof rec.updatedAt === "number" ? rec.updatedAt : undefined;
+      if (!act.last || (updated ?? 0) > (act.last.updatedAt ?? 0)) {
+        act.last = {
+          status: typeof rec.status === "string" ? rec.status : "unknown",
+          ...(updated !== undefined ? { updatedAt: updated } : {}),
+          ...(typeof rec.name === "string" && rec.name ? { name: rec.name } : {}),
+        };
+      }
+      out.set(rec.parentSessionId, act);
+    }
+  } catch {
+    // Silent degrade — see the doc comment.
+  }
+  return out;
 }
 
 // ---------- v4 conversation run queries ----------
@@ -282,12 +458,14 @@ export async function conversationRuns(
   limit?: number,
 ): Promise<Record<string, unknown>> {
   await requireWorkflowEnabled(server);
-  return rpc(
+  const result = await rpc(
     server,
     "v4/conversation/workflowRuns",
     { sessionId: zcodeSid, limit: clampLimit(limit, 64, 64) },
     TIMEOUT_V4_MS,
   );
+  stripDismissedRuns(result);
+  return result;
 }
 
 /** `v4/conversation/workflowRunEvents` — journal events, cursor never expires. */
@@ -435,12 +613,13 @@ function reasonToken(reasonCode: string, status: unknown): string {
  * Send one v4 command envelope and await the terminal ack. `request()` (not
  * `send()`) is deliberate: the gateway resolves the RPC only after the side
  * effect settles, so a compile failure is reported HERE instead of surfacing
- * as a run that never starts. Neither startSavedWorkflow nor resumeWorkflowRun
- * requires a baseRevision (workflowRuns is revision-exempt upstream).
+ * as a run that never starts. None of startSavedWorkflow / resumeWorkflowRun /
+ * amendWorkflowRunSettings carries a baseRevision (workflowRuns is
+ * revision-exempt upstream).
  */
 async function sendCommand(
   server: ZcodeAcpServer,
-  type: "startSavedWorkflow" | "resumeWorkflowRun",
+  type: "startSavedWorkflow" | "resumeWorkflowRun" | "amendWorkflowRunSettings",
   zcodeSid: string,
   payload: Record<string, unknown>,
 ): Promise<CommandAck> {
@@ -618,6 +797,11 @@ export async function startSavedWorkflow(
     throwAckRejection(ack, "startSavedWorkflow");
   }
   const result = (ack.result ?? {}) as { runId?: unknown; toolCallId?: unknown };
+  if (typeof result.runId === "string" && result.runId && input.name) {
+    // Offline push titles read the workflow name at run-settle time
+    // (server.workflowRunNames → armWorkflowRunPoller → pushRunSettled).
+    server.workflowRunNames.set(result.runId, input.name);
+  }
   return {
     acpSessionId: input.acpSessionId ?? createdAcpSid!,
     ...(typeof result.runId === "string" ? { runId: result.runId } : {}),
@@ -641,6 +825,255 @@ export async function resumeWorkflowRun(
     ...(input.name ? { name: input.name } : {}),
   });
   if (ack.status !== "accepted") throwAckRejection(ack, "resumeWorkflowRun");
+  if (input.name) server.workflowRunNames.set(input.runId, input.name);
+}
+
+/**
+ * Stop a flying run. There is no v4 stop command (the family's stop is the
+ * plain `session/cancelBackgroundTask` RPC the ACP extension forwards,
+ * taskId ≡ runId — the same identity equation as resume/amend), so this is
+ * that RPC reached from the settings route: the management page can stop a
+ * run on ANY hub instance, not just the one its ACP socket is bound to.
+ */
+export async function stopWorkflowRun(
+  server: ZcodeAcpServer,
+  input: { runId: string; acpSessionId: string },
+): Promise<void> {
+  await requireWorkflowEnabled(server);
+  const zcodeSid = await mapProvidedSession(server, input.acpSessionId);
+  let cancelled = false;
+  try {
+    const backend = await server.ensureBackend();
+    const resp = await backend.request(
+      server.nextId(),
+      "session/cancelBackgroundTask",
+      { sessionId: zcodeSid, taskId: input.runId },
+      15_000,
+    );
+    if (resp.error) {
+      throw new WorkflowApiError(502, "command_failed", resp.error.message ?? "unknown error");
+    }
+    cancelled = (resp.result as { cancelled?: boolean } | null)?.cancelled === true;
+  } catch (e) {
+    if (e instanceof WorkflowApiError) throw e;
+    throw new WorkflowApiError(502, "command_failed", messageOf(e));
+  }
+  if (!cancelled) {
+    throw new WorkflowApiError(409, "not_running", "run not found or already settled");
+  }
+  // Reflect the stop on the ACP tool card for whoever has the session open
+  // (same best-effort reflection the extension handler does).
+  const listener = server.backgroundListeners.get(zcodeSid);
+  if (listener) void listener.markCancelled(input.runId).catch((): undefined => undefined);
+}
+
+// ---------- run dismissal (bridge-side hide list) ----------
+
+/**
+ * Hide one settled run from every run list this bridge serves. Refused with
+ * 409 while the journal still shows the run running/pending — stop it first.
+ * A run outside the journal's newest window is long settled and always
+ * dismissible; a journal read that fails fails OPEN (nothing answering means
+ * nothing can be flying, and the stale "running" row a dead bridge leaves
+ * behind is exactly the noise this exists to clear). Idempotent: dismissing
+ * an already-hidden id again is a no-op.
+ */
+export async function dismissWorkflowRun(
+  server: ZcodeAcpServer,
+  runId: string,
+): Promise<{ ok: true; dismissed: true }> {
+  await requireWorkflowEnabled(server);
+  let active = false;
+  try {
+    const result = await rpc(
+      server,
+      "workflows/runs",
+      { workspace: workspaceRef(server), limit: 50 },
+      TIMEOUT_FILE_MS,
+    );
+    const runs = result["runs"];
+    if (Array.isArray(runs)) {
+      active = runs.some(
+        (row) =>
+          typeof row === "object" &&
+          row !== null &&
+          (row as { runId?: unknown }).runId === runId &&
+          ((row as { status?: unknown }).status === "running" ||
+            (row as { status?: unknown }).status === "pending"),
+      );
+    }
+  } catch {
+    // Fail open — see the doc comment.
+  }
+  if (active) {
+    throw new WorkflowApiError(409, "run_active", "stop the run before dismissing it");
+  }
+  dismissWorkflowRunIds([runId]);
+  return { ok: true as const, dismissed: true as const };
+}
+
+/**
+ * Batch dismissal for the management page's "clear finished" action: hide
+ * every given SETTLED run (one journal read decides). Still-running ids are
+ * SKIPPED, not errors — the button clears noise, it does not stop runs.
+ */
+export async function dismissWorkflowRuns(
+  server: ZcodeAcpServer,
+  runIds: string[],
+): Promise<{ ok: true; dismissed: number; skippedActive: number }> {
+  await requireWorkflowEnabled(server);
+  const wanted = new Set(runIds.filter((id) => typeof id === "string" && id.length > 0));
+  if (wanted.size === 0) return { ok: true as const, dismissed: 0, skippedActive: 0 };
+  const active = new Set<string>();
+  try {
+    const result = await rpc(
+      server,
+      "workflows/runs",
+      { workspace: workspaceRef(server), limit: 50 },
+      TIMEOUT_FILE_MS,
+    );
+    const runs = result["runs"];
+    if (Array.isArray(runs)) {
+      for (const row of runs) {
+        if (row === null || typeof row !== "object") continue;
+        const rec = row as { runId?: unknown; status?: unknown };
+        if (typeof rec.runId !== "string" || !wanted.has(rec.runId)) continue;
+        if (rec.status === "running" || rec.status === "pending") active.add(rec.runId);
+      }
+    }
+  } catch {
+    // Fail open — same rule as the single dismiss.
+  }
+  const ids = [...wanted].filter((id) => !active.has(id));
+  return {
+    ok: true as const,
+    dismissed: dismissWorkflowRunIds(ids),
+    skippedActive: active.size,
+  };
+}
+
+/**
+ * Bulk dismissal for the session panel's noise case: hide every SETTLED run
+ * of one session. Active runs stay by construction — they are the list's
+ * live content — and already-dismissed ids add nothing.
+ */
+export async function dismissFinishedSessionRuns(
+  server: ZcodeAcpServer,
+  acpSessionId: string,
+): Promise<{ ok: true; dismissed: number }> {
+  await requireWorkflowEnabled(server);
+  const zcodeSid = await mapProvidedSession(server, acpSessionId);
+  const result = await conversationRuns(server, zcodeSid);
+  const runs = result["runs"];
+  const ids = Array.isArray(runs)
+    ? runs.flatMap((row) => {
+        if (row === null || typeof row !== "object") return [];
+        const rec = row as { runId?: unknown; status?: unknown };
+        if (typeof rec.runId !== "string") return [];
+        return rec.status === "running" || rec.status === "pending" ? [] : [rec.runId];
+      })
+    : [];
+  return { ok: true as const, dismissed: dismissWorkflowRunIds(ids) };
+}
+
+// ---------- run settings amendment (v4/command, same family as resume) ----------
+
+/**
+ * Fixed HTTP statuses for the amend command's rejection tokens (the command's
+ * own semantics decide the class): not_found is addressing; the three state
+ * conflicts are 409s; the three value problems are 422s; start_failed is the
+ * port/submit fault, a backend-side failure. Tokens NOT in this table —
+ * capabilityUnsupported above all — keep the generic command mapping
+ * (`codeForCommandReason`: capability absence is 501, exactly what
+ * resumeWorkflowRun answers today).
+ */
+const AMEND_REJECTION_STATUS: Record<string, number> = {
+  not_found: 404,
+  not_configurable: 409,
+  unchanged: 409,
+  missing_boundaries: 409,
+  model_unavailable: 422,
+  script_missing: 422,
+  compile_failed: 422,
+  start_failed: 502,
+};
+
+export interface AmendRunSettingsInput {
+  runId: string;
+  acpSessionId: string;
+  /** `provider/model[$level]`; `null` = back to the session model; absent = keep. */
+  subagentModel?: string | null;
+  /** The run's own bound; `null` = clear it (back to the machine ceiling); absent = keep. */
+  maxConcurrency?: number | null;
+}
+
+export interface AmendRunSettingsResult {
+  /**
+   * The run that continues the work — SAME id for an in-place change, the NEW
+   * run after a supersede.
+   */
+  runId: string;
+  toolCallId: string;
+  /** Present only when the amendment stopped and superseded a flying run. */
+  supersededRunId?: string;
+}
+
+/**
+ * Amend a run's settings through the v4 `amendWorkflowRunSettings` command.
+ * The stop-and-supersede (script/subagent-model change on a flying run) is
+ * the COMMAND's own semantics — this handler never adds a stop step, and it
+ * never creates or discards a session (the run lives in the caller's).
+ */
+export async function amendRunSettings(
+  server: ZcodeAcpServer,
+  input: AmendRunSettingsInput,
+): Promise<AmendRunSettingsResult> {
+  await requireWorkflowEnabled(server);
+  if (input.subagentModel === undefined && input.maxConcurrency === undefined) {
+    throw new WorkflowApiError(
+      422,
+      "unchanged",
+      "nothing to amend — send subagentModel and/or maxConcurrency",
+    );
+  }
+  const zcodeSid = await mapProvidedSession(server, input.acpSessionId);
+  const ack = await sendCommand(server, "amendWorkflowRunSettings", zcodeSid, {
+    workId: input.runId,
+    ...(input.subagentModel !== undefined ? { subagentModel: input.subagentModel } : {}),
+    ...(input.maxConcurrency !== undefined ? { maxConcurrency: input.maxConcurrency } : {}),
+  });
+  if (ack.status !== "accepted") {
+    const reasonCode = typeof ack.reasonCode === "string" ? ack.reasonCode : "";
+    const token = reasonToken(reasonCode, ack.status);
+    const status = AMEND_REJECTION_STATUS[token];
+    if (status !== undefined) {
+      throw new WorkflowApiError(
+        status,
+        token,
+        typeof ack.message === "string" && ack.message ? ack.message : undefined,
+      );
+    }
+    throwAckRejection(ack, "amendWorkflowRunSettings");
+  }
+  const result = (ack.result ?? {}) as {
+    runId?: unknown;
+    toolCallId?: unknown;
+    supersededRunId?: unknown;
+  };
+  if (typeof result.runId !== "string" || typeof result.toolCallId !== "string") {
+    throw new WorkflowApiError(
+      502,
+      "command_failed",
+      "amend ack is missing runId/toolCallId — the app cannot re-point its run view",
+    );
+  }
+  return {
+    runId: result.runId,
+    toolCallId: result.toolCallId,
+    ...(typeof result.supersededRunId === "string"
+      ? { supersededRunId: result.supersededRunId }
+      : {}),
+  };
 }
 
 // ---------- create prompt (frozen desktop copy) ----------

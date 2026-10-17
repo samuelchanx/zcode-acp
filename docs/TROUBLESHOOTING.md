@@ -27,6 +27,10 @@
    ```
    - If not found, set: `export ZCODE_BIN=/path/to/zcode`
 
+   Which engine binary the bridge actually resolved — the `resolve: launching
+zcode with …` line, including every probe fallback — only prints with
+   `ZCODE_ACP_DEBUG=1`; set it before reporting backend-resolution issues (#320).
+
 3. Check the ZCode configuration:
 
    ```bash
@@ -104,10 +108,15 @@ account provider. A `headersApplied:false` answer makes the turn fail with
 -32031 and retry. The bridge (0.42.5+) answers with the coding plan's API key
 from `~/.zcode/v2/config.json` (`codingPlanRequestAuthFor`) — if sends still
 fail, check that the enabled `builtin:bigmodel-coding-plan` entry carries a
-non-empty `options.apiKey` in that file. The bigmodel start plan is served the
-same way (its `builtin:bigmodel-start-plan` entry's JWT); team/off-peak plans
-and keyless start plans stay declined (store-encrypted / missing credentials,
-issue #123 history).
+non-empty `options.apiKey` in that file. On a fresh desktop-only install that
+never wrote `config.json`, both the entitlement snapshot and the request key
+come from the encrypted store `~/.zcode/v2/credentials.json` instead (#320) —
+log into the ZCode desktop app once so it exists. The bigmodel start plan is
+served the same way (its `builtin:bigmodel-start-plan` entry's JWT; this fork
+deliberately serves headless start plans — ADR-0008, captcha era ended
+server-side) while upstream declines start-plan behind the Aliyun captcha
+(desktop app only, issue #123). Team/off-peak plans and keyless start plans
+stay declined (store-encrypted / missing credentials).
 
 ### Authentication / credential errors (401, provider auth failed)
 

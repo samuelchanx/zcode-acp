@@ -54,7 +54,7 @@ import {
 import { loadPluginCommands } from "../config/plugin-commands.js";
 import { loadSkillCommands } from "../config/skill-discovery.js";
 import { goalModeIsBackend } from "../config/settings.js";
-import { workflowGateNow } from "../config/workflow-gate.js";
+import { effectiveWorkflowGateNow } from "../config/workflow-gate.js";
 import { messages } from "../i18n.js";
 import { formatQuota, queryQuota } from "../quota/index.js";
 import { CONFIG_DISPATCH, SLASH_COMMANDS, warn } from "../utils.js";
@@ -610,16 +610,23 @@ export async function handleSlashCommand(
         // the change — slash commands return end_turn and bypass the turn-
         // completion reconciliation in prompt().
         await emitConfigOptionUpdate(server, cx, acpSid, zcodeSid, cmd);
-        if (cmd === "mode") server.lastMode.set(acpSid, arg);
+        if (cmd === "mode") {
+          server.lastMode.set(acpSid, arg);
+          // Same execution-state fold as the setMode extension: "plan" enables
+          // the runtime plan flag, anything else disables it.
+          if (arg === "plan") server.sessionPlanActive.add(zcodeSid);
+          else server.sessionPlanActive.delete(zcodeSid);
+        }
         return ok(`✓ ${cmd} = ${arg}`);
       }
       case "workflow": {
-        // Gate first (backend capability + desktop-host remote verdict,
-        // fail-closed): unsupported kind, disabled or still pending →
-        // friendly notice instead of passing raw text to the model.
+        // Gate first (backend capability + the effective gate — local override
+        // first, else the remote verdict, fail-closed): unsupported kind,
+        // disabled or still pending → friendly notice instead of passing raw
+        // text to the model.
         if (
           !backendCapabilities(server.backendKind).workflowCommands ||
-          !workflowGateNow(server)?.enabled
+          !effectiveWorkflowGateNow(server)?.enabled
         ) {
           return ok(messages().workflowDisabled);
         }
@@ -634,7 +641,7 @@ export async function handleSlashCommand(
         // straight from the backend's session-less workflows/* RPCs.
         if (
           !backendCapabilities(server.backendKind).workflowCommands ||
-          !workflowGateNow(server)?.enabled
+          !effectiveWorkflowGateNow(server)?.enabled
         ) {
           return ok(messages().workflowDisabled);
         }

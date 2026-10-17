@@ -26,8 +26,9 @@ import {
   zcodePersonalProviderPath,
 } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
-import { configProviderIdFor, isStartPlanProviderId } from "./account-provider.js";
 import { isBroadcastSource, sendSessionUpdate, sendSessionUpdateToOthers } from "../handlers/io.js";
+import { configProviderIdFor } from "./account-provider.js";
+import { initialSessionMode } from "./settings.js";
 
 interface ProviderModelsJson {
   [modelId: string]: { limit?: { context?: number } } | undefined;
@@ -199,15 +200,7 @@ export interface ModelRef {
  */
 export function providerSelectable(pid: string, p: ProviderEntry | undefined): boolean {
   if (!p) return false;
-  if (isBuiltinProvider(pid)) {
-    // Start-plan entries: the desktop writes `enabled:false` even while the
-    // plan is the user's active connection — the flag tracks legacy-provider
-    // selection, not start-plan membership (verified 2026-09-30). The plan
-    // JWT's presence is the connection record, mirroring the entitlement rule
-    // in account-provider.ts.
-    if (isStartPlanProviderId(pid)) return Boolean(p.options?.apiKey);
-    return p.enabled === true && Boolean(p.options?.apiKey);
-  }
+  if (isBuiltinProvider(pid)) return p.enabled === true && Boolean(p.options?.apiKey);
   if (p.enabled === false) return false;
   if (p.options?.apiKey) return true;
   if (p.options?.apiKeyRequired === false) return true;
@@ -275,8 +268,18 @@ export function loadAllModels(): ModelRef[] {
       if (pinned && pid !== pinned) continue;
       if (!providerSelectable(pid, p)) continue;
       const providerName = p.name ?? pid;
-      const ids = new Set(Object.keys(p.models ?? {}));
-      for (const modelId of personal?.modelsByProvider.get(pid) ?? []) ids.add(modelId);
+      // Custom providers: once the personal config tracks the provider's
+      // models, THAT list is authoritative. Additions AND deletions land only
+      // there (config.json stopped syncing), and the backend registry knows no
+      // other source for the provider's models — a config.json-only entry is a
+      // deleted-model ghost that fails on switch (observed 2026-09-28). Builtin
+      // providers keep the union: their catalog comes from the account
+      // snapshot, and a personal rule is an override, not a complete list.
+      const personalIds = personal?.modelsByProvider.get(pid);
+      const ids =
+        personalIds !== undefined && !isBuiltinProvider(pid)
+          ? new Set(personalIds)
+          : new Set([...Object.keys(p.models ?? {}), ...(personalIds ?? [])]);
       for (const modelId of ids) {
         out.push({ providerId: pid, providerName, modelId });
       }
@@ -375,57 +378,27 @@ function collidingModelIds(models: ModelRef[]): Set<string> {
 }
 
 function buildModelSelectOptions(models: ModelRef[]): Array<{ value: string; name: string }> {
+  const collidingIds = collidingModelIds(models);
   const options: Array<{ value: string; name: string }> = [];
   const seen = new Set<string>();
   for (const model of models) {
-    // modelChoiceValue is the single spelling rule for choices AND
-    // currentValue — an inline duplicate here is how the two drift apart.
-    const value = modelChoiceValue(model.providerId, model.modelId, models);
+    const value = formatModelValue(model.providerId, model.modelId);
     if (seen.has(value)) continue;
     seen.add(value);
-    const qualified = value !== model.modelId;
+    const qualify = collidingIds.has(model.modelId) || !isBuiltinProvider(model.providerId);
     options.push({
       value,
-      name: qualified ? `${model.providerName} › ${model.modelId}` : model.modelId,
+      name: qualify ? `${model.providerName} › ${model.modelId}` : model.modelId,
     });
   }
   return options;
 }
 
 /**
- * Spell a provider+model as an ADVERTISED configOption value (choice or
- * currentValue): the legacy bare modelId while this provider is the id's
- * FIRST builtin holder, qualified `providerId\modelId` for secondary holders
- * of a colliding id and for third-party providers.
- *
- * Bare is load-bearing for orchestrators: ACP clients such as Paseo validate a
- * REQUESTED model id by exact match against the advertised choice values
- * before sending the switch — an always-qualified encoding makes their stored
- * bare ids fail validation client-side and the session silently keeps the
- * default model (observed 2026-09-26). So when a second coding plan (start
- * plan, 2026-09-30) makes an id collide, the FIRST holder keeps the bare
- * spelling and later holders qualify — which mirrors exactly how
- * parseModelValue resolves a bare id inbound (first builtin owner wins), so
- * every stored bare id keeps meaning the same provider it always did.
- */
-export function modelChoiceValue(
-  providerId: string,
-  modelId: string,
-  models: ModelRef[] = loadAllModels(),
-): string {
-  const firstOwner = models.find((m) => m.modelId === modelId && isBuiltinProvider(m.providerId));
-  const ambiguous =
-    !isBuiltinProvider(providerId) ||
-    (collidingModelIds(models).has(modelId) && firstOwner?.providerId !== providerId);
-  return ambiguous ? formatModelValue(providerId, modelId) : modelId;
-}
-
-/**
  * Parse a configOption `value` back into { providerId, modelId }.
  *
- * A value without `\` is a legacy bare modelId → resolved to the enabled
- * provider that OWNS it (see the bare-id branch below). A value with `\` is
- * the current provider+model encoding.
+ * A value without `\` is a legacy bare modelId → resolve to the first enabled
+ * builtin provider. A value with `\` is the current provider+model encoding.
  */
 export function parseModelValue(value: string): { providerId: string; modelId: string } {
   // New-format (3.12+) agent-definition spelling: `custom:<urlencoded
@@ -441,21 +414,11 @@ export function parseModelValue(value: string): { providerId: string; modelId: s
   }
   const idx = value.indexOf("\\");
   if (idx < 0) {
-    // Bare modelId — resolve to the enabled provider that CARRIES it, not
-    // the first enabled builtin: with two enabled plans, a model unique to
-    // the second is still advertised bare (only colliding ids qualify), and
-    // attributing it to the first plan makes applyModelSwitch fail with
-    // "Provider Registry 中不存在 Model" — the selected-model-not-applied
-    // shape. Builtin owners win the lookup (bare ids are only advertised
-    // for builtins); unknown ids keep the first-builtin fallback so the
-    // switch surfaces the registry's own error.
-    const models = loadAllModels();
-    const owner =
-      models.find((m) => m.modelId === value && isBuiltinProvider(m.providerId)) ??
-      models.find((m) => m.modelId === value);
-    const firstBuiltin = models.find((m) => isBuiltinProvider(m.providerId));
+    // Builtin plain modelId — resolve to the first enabled builtin provider
+    // (falling back to the legacy default if none configured).
+    const firstBuiltin = loadAllModels().find((m) => isBuiltinProvider(m.providerId));
     return {
-      providerId: owner?.providerId ?? firstBuiltin?.providerId ?? DEFAULT_PROVIDER_ID,
+      providerId: firstBuiltin?.providerId ?? DEFAULT_PROVIDER_ID,
       modelId: value,
     };
   }
@@ -469,7 +432,10 @@ export async function buildModes(
   server: ZcodeAcpServer,
   zcodeSid: string | null,
 ): Promise<acp.SessionModeState> {
-  let currentMode = "yolo";
+  // Pending sessions (and a failed session/read) fall back to the configured
+  // initial mode — the exact value session/create sends at materialization —
+  // so the indicator never shows a mode the session will not run in.
+  let currentMode = initialSessionMode();
   if (zcodeSid !== null) {
     try {
       const read = await sessionRead(server, zcodeSid);
@@ -479,13 +445,24 @@ export async function buildModes(
     } catch {
       // keep default
     }
+    // The runtime's plan tools (EnterPlanMode/ExitPlanMode) flip the execution
+    // state's planEnabled WITHOUT touching settings.mode — the v3 read keeps
+    // reporting the underlying mode (verified upstream: mapSessionSettings
+    // reads app.getMode()). Fold the tracked flag so the advertised mode
+    // matches what the session actually runs.
+    if (server.sessionPlanActive.has(zcodeSid) && currentMode !== "plan") {
+      currentMode = "plan";
+    }
   }
   return {
     currentModeId: currentMode,
-    // ZCode 3.3.0 mode enum: plan/build/edit/yolo/auto. settings.mode only
-    // carries `current` (no `available` list, unlike thoughtLevel), so the full
-    // enum is advertised here.
-    availableModes: ["plan", "build", "edit", "yolo", "auto"].map((m) => ({
+    // ZCode mode enum: plan/build/edit/guarded/yolo/auto — guarded is new in
+    // 3.15.1 (yolo semantics + a one-time approval on AST-recognized dangerous
+    // shell commands); `auto` stays internal-only upstream, so the dropdown
+    // does not advertise it (the backend still accepts it on the wire).
+    // settings.mode only carries `current` (no `available` list, unlike
+    // thoughtLevel), so the vocabulary is advertised here.
+    availableModes: ["plan", "build", "edit", "guarded", "yolo"].map((m) => ({
       id: m,
       name: capitalize(m),
     })),
@@ -517,8 +494,9 @@ export function orderThoughtVariants(variants: string[]): Array<{ value: string;
 
 /** Build the ACP configOptions array (3 items: model/mode/thought).
  *  zcodeSid null = pending session — skip the backend read and use defaults;
- *  mode defaults to "yolo" (the mode session/create hardcodes) so the dropdown
- *  matches the mode indicator for a fresh session.
+ *  mode defaults to the configured initial mode (initialSessionMode — what
+ *  session/create sends at materialization) so the dropdown matches the mode
+ *  indicator for a fresh session.
  *  `receiverRoot` is the clientConnectionRoot of the client the array is
  *  delivered to — the quota pseudo-option is appended only for martty
  *  connections (ADR-0021); other receivers get the spec-clean 3 options. */
@@ -529,7 +507,7 @@ export async function buildConfigOptions(
 ): Promise<acp.SessionConfigOption[]> {
   let currentProviderId = "";
   let currentModelId = DEFAULT_MODEL_ID;
-  let currentMode = zcodeSid === null ? "yolo" : "build";
+  let currentMode = zcodeSid === null ? initialSessionMode() : "build";
   // Matches the enabled provider's default reasoning variants (GLM-5.3:
   // max/high/low, default max). Pending sessions show this until the real
   // session/read thoughtLevel arrives.
@@ -598,9 +576,26 @@ export async function buildConfigOptions(
       const tlAvail = (tlSet.available as Array<Record<string, string>>) ?? [];
       if (tlAvail.length > 0) {
         thoughtOptions = tlAvail.map((a) => ({ value: a.value, name: a.label ?? a.value }));
+        // setModel can leave the runtime briefly holding the PREVIOUS model's
+        // thoughtLevel (upstream clamps its own snapshot for the same reason —
+        // session-mapper.ts: "setModel 后 runtime 可能短暂保留上一个模型的
+        // thoughtLevel"). Never advertise a current outside the new model's
+        // list: the CLI would keep displaying — and re-sending — the old
+        // model's level (observed 2026-09-28 after switches between models
+        // with different level vocabularies).
+        const values = new Set(tlAvail.map((a) => a.value));
+        if (!values.has(currentThought)) {
+          const def = typeof tlSet.defaultLevel === "string" ? tlSet.defaultLevel : undefined;
+          currentThought = def && values.has(def) ? def : (tlAvail[0]?.value ?? currentThought);
+        }
       }
     } catch {
       // keep defaults
+    }
+    // Same plan-flag fold as buildModes: a plan-active runtime still reports
+    // the underlying mode in settings, and the dropdown must show "plan".
+    if (server.sessionPlanActive.has(zcodeSid) && currentMode !== "plan") {
+      currentMode = "plan";
     }
   }
 
@@ -609,15 +604,11 @@ export async function buildConfigOptions(
   // when settings omits providerId (legacy sessions).
   const allModels = loadAllModels();
   const currentProvider = currentProviderId || allModels[0]?.providerId || DEFAULT_PROVIDER_ID;
-  // currentValue uses the SAME spelling rule as the choices so client
-  // dropdowns highlight the active model (a qualified current over bare
-  // choices — or vice versa — reads as "nothing selected").
-  const currentModel = modelChoiceValue(currentProvider, currentModelId, allModels);
+  const currentModel = formatModelValue(currentProvider, currentModelId);
 
   // Model options: config.json enabled providers are authoritative. Values
-  // use the same spelling rule as currentValue (see modelChoiceValue): bare
-  // modelId unless the bare id is ambiguous (colliding builtin ids across
-  // coding plans) or third-party.
+  // are always providerId\modelId. Builtin labels stay the bare modelId
+  // unless two providers ship the same id; third-party labels always qualify.
   let modelOptions = buildModelSelectOptions(allModels);
   if (!modelOptions.some((o) => o.value === currentModel)) {
     // The current model isn't from an enabled provider (e.g. the session was

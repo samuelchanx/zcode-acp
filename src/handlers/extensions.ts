@@ -83,6 +83,10 @@ export async function fork(server: ZcodeAcpServer, params: ExtensionParams): Pro
     // and reloads without the client MCP servers. The source session's
     // remembered set is inherited so every later reload re-sends it (#193).
     server.markBackendLoaded(result.forkedSessionId);
+    // The fork's store snapshot is complete at creation — seed the settle
+    // watermark so replay paths skip the generation's first-read settle poll
+    // (entry presence = observed-settled, see fetchMessagesForReplay).
+    server.hydrationWatermark.set(result.forkedSessionId, 0);
     const srcMcp = server.sessionMcpServers.get(params.sessionId);
     if (srcMcp) server.sessionMcpServers.set(result.forkedSessionId, srcMcp);
     await server.ensureBackgroundListener(result.forkedSessionId);
@@ -324,6 +328,12 @@ export async function setMode(
   ).request(server.nextId(), "session/setMode", { sessionId: zcodeSid, mode }, 15000);
   if (resp.error) throw new Error(`setMode failed: ${resp.error.message}`);
   log(`session/setMode → ${mode}`);
+  // Mirror the runtime's own execution-state fold NOW (mode "plan" enables
+  // the plan flag, any other mode disables it — resolveExecutionState): the
+  // SessionModeChanged event may arrive after this RPC response, and the
+  // emission below must not advertise the pre-transition value.
+  if (mode === "plan") server.sessionPlanActive.add(zcodeSid);
+  else server.sessionPlanActive.delete(zcodeSid);
   // Re-build configOptions (settings.mode.current is now updated) and emit
   // config_option_update + current_mode_update to EVERY attached client, so
   // the editor UI reflects it no matter which connection switched.
