@@ -88,7 +88,6 @@ const TABLE = {
           },
         },
         {
-        {
           providerId: "account:bigmodel-start-plan",
           config: {
             access: { type: "zhipu-account", mode: "start-plan", accountType: "bigmodel" },
@@ -107,8 +106,6 @@ const TABLE = {
           config: {
             access: { type: "zhipu-account", mode: "team-coding-plan", accountType: "bigmodel" },
             builtinModelIds: ["GLM-5.3"],
-          },
-        },
           },
         },
       ],

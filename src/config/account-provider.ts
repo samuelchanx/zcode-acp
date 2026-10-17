@@ -204,7 +204,6 @@ function storeIndividualCodingPlanKey(accountProviderId: string): string | null 
   }
   return null;
 }
-}
 
 /**
  * The plans the user actually holds, keyed by the LEGACY `builtin:<family>-<plan>`

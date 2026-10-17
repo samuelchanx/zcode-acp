@@ -264,8 +264,8 @@ describeBuilt("paseo-plugin catalog (built bridge, hermetic)", () => {
         "plan",
         "build",
         "edit",
+        "guarded",
         "yolo",
-        "auto",
       ]);
       expect(event.catalog.defaultMode).toBe("yolo");
     } finally {

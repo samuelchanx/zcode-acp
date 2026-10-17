@@ -149,24 +149,6 @@ describe("parseArgs — plain flag", () => {
     expect(opts.detail).toBe(true);
   });
 });
-
-describe("parseArgs — json flag", () => {
-  it("empty argv → json defaults to false", () => {
-    expect(parseArgs([]).json).toBe(false);
-  });
-
-  it("-j / --json set json to true", () => {
-    expect(parseArgs(["-j"]).json).toBe(true);
-    expect(parseArgs(["--json"]).json).toBe(true);
-  });
-
-  it("json combines with a provider positional", () => {
-    expect(parseArgs(["glm", "--json"]).json).toBe(true);
-    expect(parseArgs(["glm", "--json"]).provider).toBe("glm");
-  });
-
-  it("json implies one-shot mode (watch wins nothing — last-run semantics follow main)", () => {
-    const opts = parseArgs(["-j"]);
-    expect(opts.watch).toBe(false);
-  });
-});
+// The fork's `--json` flag (aa81708) died in the merge — upstream's quota bin
+// (glm/go/oc/cp cards) ships no json option; "json implies one-shot" survives
+// upstream-side.
